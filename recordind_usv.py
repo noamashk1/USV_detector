@@ -129,12 +129,15 @@ class RecordingApp:
         """זיהוי כרטיס Scarlett להשמעה"""
         try:
             devices = sd.query_devices()
+            print("\nAvailable audio devices:")
             for i, device in enumerate(devices):
+                print(f"  {i}: {device['name']} (inputs: {device['max_input_channels']}, outputs: {device['max_output_channels']})")
                 if "Scarlett" in device["name"] and device["max_output_channels"] > 0:
                     self.playback_device = i
                     print(f"Found Scarlett device: {device['name']} (index {i})")
-                    return
-            print("Warning: Scarlett device not found, using default device")
+            print()
+            if self.playback_device is None:
+                print("Warning: Scarlett device not found, using default device")
         except Exception as e:
             print(f"Error detecting audio device: {e}")
     
@@ -151,18 +154,23 @@ class RecordingApp:
             self.loop_audio_data, file_fs = sf.read(self.loop_audio_file)
             print(f"Loaded audio file: {file_fs} Hz")
             
-            # Resample if file fs is greater than target fs
-            target_fs = 192000
+            # Must use 192000 Hz to preserve ultrasonic frequencies (70 kHz USVs)
+            # Recording at 192000 Hz captures up to 96 kHz
+            target_fs = 192000  # Match recording sample rate
             if file_fs > target_fs:
                 # Calculate resampling factor
                 factor = target_fs / file_fs
                 num_samples = int(len(self.loop_audio_data) * factor)
-                print(f"Resampling from {file_fs} Hz to {target_fs} Hz ({factor:.2f}x slower)")
+                print(f"Resampling from {file_fs} Hz to {target_fs} Hz ({factor:.2f}x slower) for playback")
                 self.loop_audio_data = signal.resample(self.loop_audio_data, num_samples)
                 self.loop_fs = target_fs
+            elif file_fs != target_fs:
+                # If file is already lower, just use it
+                self.loop_fs = file_fs
+                print(f"Using original sample rate: {file_fs} Hz")
             else:
                 self.loop_fs = file_fs
-                print(f"No resampling needed: {file_fs} Hz")
+                print(f"Using target sample rate: {file_fs} Hz")
             
             print(f"Loop audio ready: {self.loop_fs} Hz, {len(self.loop_audio_data)/self.loop_fs:.2f}s")
         except Exception as e:
@@ -176,27 +184,23 @@ class RecordingApp:
             return
         
         print(f"Starting loop playback at {self.loop_fs} Hz...")
-        if self.playback_device is not None:
-            print(f"Using device index: {self.playback_device}")
         self.is_playing_loop = True
         
         try:
-            # Keep playing while recording
+            # Use loop=True to avoid conflicts
+            sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
+            print("Playback started with loop=True")
+            
+            # Wait while recording is active
             while self.is_playing_loop and self.is_recording:
-                if self.playback_device is not None:
-                    sd.play(self.loop_audio_data, samplerate=self.loop_fs, device=self.playback_device)
-                else:
-                    sd.play(self.loop_audio_data, samplerate=self.loop_fs)
-                # Wait for playback to finish
-                sd.wait()
-                
-                # Check if we should continue
-                if not self.is_playing_loop or not self.is_recording:
-                    break
+                import time
+                time.sleep(0.1)  # Check every 100ms
                     
             print("Loop playback stopped")
         except Exception as e:
             print(f"Error playing loop: {e}")
+            import traceback
+            traceback.print_exc()
             self.is_playing_loop = False
     
     def stop_loop(self):
@@ -241,9 +245,19 @@ class RecordingApp:
         """הקלטת אודיו"""
         try:
             print("Recording..")
-            self.recording_data = sd.rec(int(self.fs * self.duration), 
-                                       samplerate=self.fs, channels=1, dtype='float32')
-            sd.wait()
+            # Use InputStream to allow simultaneous playback
+            frames = int(self.fs * self.duration)
+            with sd.InputStream(samplerate=self.fs, channels=1, dtype='float32', blocksize=4096) as stream:
+                self.recording_data = np.zeros((frames,), dtype='float32')
+                total_read = 0
+                while total_read < frames:
+                    remaining = frames - total_read
+                    to_read = min(remaining, 4096)
+                    data, overflow = stream.read(to_read)
+                    if overflow:
+                        print(f"Warning: buffer overflow during recording")
+                    self.recording_data[total_read:total_read+len(data)] = data[:, 0]
+                    total_read += len(data)
             print("Done")
 
             # Update GUI
