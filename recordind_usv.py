@@ -8,6 +8,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import threading
 import os
+import wave
 
 class RecordingApp:
     def __init__(self, master):
@@ -20,10 +21,14 @@ class RecordingApp:
         self.duration = 60
         self.recording_data = None
         self.is_recording = False
+        self.is_playing_loop = False  # Flag to control loop playback
         
         # Visualization parameters
         self.view_duration = 10.0  # seconds to display
         self.current_start_time = 0.0
+        
+        # Load loop audio file
+        self.load_loop_audio()
         
         # GUI setup
         self.setup_gui()
@@ -50,6 +55,11 @@ class RecordingApp:
         tk.Label(params_frame, text="Sample Rate:").pack(side=tk.LEFT, padx=5)
         self.fs_var = tk.StringVar(value="192000")
         tk.Entry(params_frame, textvariable=self.fs_var, width=10).pack(side=tk.LEFT, padx=5)
+        
+        # Play loop checkbox
+        self.play_loop_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(record_frame, text="Play USV loop during recording", 
+                      variable=self.play_loop_var, font=("Arial", 10)).pack(pady=5)
         
         # Recording buttons
         button_frame = tk.Frame(record_frame)
@@ -108,6 +118,47 @@ class RecordingApp:
         
         # Initial empty plot
         self.update_plot()
+    
+    def load_loop_audio(self):
+        """טעינת קובץ הלולאה"""
+        self.loop_audio_file = "pup ICR USVs.wav"
+        if not os.path.exists(self.loop_audio_file):
+            self.loop_audio_data = None
+            print(f"Warning: Loop audio file '{self.loop_audio_file}' not found")
+            return
+        
+        try:
+            # Load the loop audio file
+            self.loop_fs, self.loop_audio_data = wav.read(self.loop_audio_file)
+            # Convert to float32
+            if self.loop_audio_data.dtype == np.int16:
+                self.loop_audio_data = self.loop_audio_data.astype(np.float32) / 32767.0
+            elif self.loop_audio_data.dtype == np.int32:
+                self.loop_audio_data = self.loop_audio_data.astype(np.float32) / 2147483647.0
+            
+            print(f"Loop audio loaded: {self.loop_fs} Hz, {len(self.loop_audio_data)/self.loop_fs:.2f}s")
+        except Exception as e:
+            self.loop_audio_data = None
+            print(f"Error loading loop audio: {e}")
+    
+    def play_loop(self):
+        """ניגון הלולאה ברקע"""
+        if not self.loop_audio_data:
+            return
+        
+        self.is_playing_loop = True
+        while self.is_playing_loop and self.is_recording:
+            try:
+                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
+                sd.wait()
+            except Exception as e:
+                print(f"Error playing loop: {e}")
+                break
+    
+    def stop_loop(self):
+        """עצירת הלולאה"""
+        self.is_playing_loop = False
+        sd.stop()
         
     def start_recording(self):
         """התחלת הקלטה"""
@@ -120,7 +171,15 @@ class RecordingApp:
             
             self.is_recording = True
             self.record_button.config(text="Recording...", state=tk.DISABLED)
-            self.status_label.config(text=f"Recording for {self.duration} seconds...")
+            status_msg = f"Recording for {self.duration} seconds..."
+            if self.play_loop_var.get():
+                status_msg += " (with USV loop)"
+            self.status_label.config(text=status_msg)
+            
+            # Start playing loop if enabled
+            if self.play_loop_var.get() and self.loop_audio_data is not None:
+                self.loop_thread = threading.Thread(target=self.play_loop, daemon=True)
+                self.loop_thread.start()
             
             # Start recording in separate thread
             self.recording_thread = threading.Thread(target=self.record_audio, daemon=True)
@@ -148,6 +207,7 @@ class RecordingApp:
     def recording_finished(self):
         """סיום הקלטה"""
         self.is_recording = False
+        self.stop_loop()  # Stop the loop playback
         self.record_button.config(text="Start Recording", state=tk.NORMAL)
         self.save_button.config(state=tk.NORMAL)
         self.status_label.config(text=f"Recording completed: {len(self.recording_data)/self.fs:.1f}s")
@@ -159,6 +219,7 @@ class RecordingApp:
     def recording_error(self):
         """שגיאה בהקלטה"""
         self.is_recording = False
+        self.stop_loop()  # Stop the loop playback
         self.record_button.config(text="Start Recording", state=tk.NORMAL)
         self.status_label.config(text="Status: Recording failed")
         
