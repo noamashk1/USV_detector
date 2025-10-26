@@ -1,0 +1,38 @@
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyCharm project files
+.idea/
+
+# VSCode settings
+.vscode/
+
+# Log files and temporary files
+*.log
+*.tmp
+*.swp
+
+# macOS and Windows system files
+.DS_Store
+Thumbs.db
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Build and distribution directories
+build/
+dist/
+*.egg-info/
+
+# Output files (e.g., plots, reports)
+*.png
+*.pdf
+*.svg
+*.wav
