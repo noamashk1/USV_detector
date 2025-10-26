@@ -128,6 +128,7 @@ class UltrasonicDetectorApp:
             try:
                 # טעינת הקובץ עם librosa
                 self.audio_data, self.sample_rate = librosa.load(file_path, sr=None)
+                print("fs=",self.sample_rate)
                 self.audio_file = file_path
                 
                 # עדכון GUI
