@@ -162,6 +162,12 @@ class RecordingApp:
             self.loop_audio_data, file_fs = sf.read(self.loop_audio_file)
             print(f"Loaded audio file: {file_fs} Hz")
             
+            # Amplify the audio (x2 for louder playback)
+            amplification = 2.0
+            self.loop_audio_data = self.loop_audio_data * amplification
+            # Clip to prevent overflow
+            self.loop_audio_data = np.clip(self.loop_audio_data, -1.0, 1.0)
+            
             # Must use 192000 Hz to preserve ultrasonic frequencies (70 kHz USVs)
             # Recording at 192000 Hz captures up to 96 kHz
             target_fs = 192000  # Match recording sample rate
@@ -197,6 +203,12 @@ class RecordingApp:
             # Load using soundfile
             self.two_kicks_data, two_kicks_fs = sf.read(self.two_kicks_file)
             print(f"Loaded two_kicks: {two_kicks_fs} Hz")
+            
+            # Amplify the audio (x3 for two_kicks since it's quieter)
+            amplification = 3.0
+            self.two_kicks_data = self.two_kicks_data * amplification
+            # Clip to prevent overflow
+            self.two_kicks_data = np.clip(self.two_kicks_data, -1.0, 1.0)
             
             # Resample to match loop fs (192000 Hz)
             target_fs = 192000
