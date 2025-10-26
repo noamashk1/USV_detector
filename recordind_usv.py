@@ -147,13 +147,14 @@ class RecordingApp:
             return
         
         self.is_playing_loop = True
-        while self.is_playing_loop and self.is_recording:
-            try:
-                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
+        try:
+            sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
+            # Keep playing while recording
+            while self.is_playing_loop and self.is_recording:
                 sd.wait()
-            except Exception as e:
-                print(f"Error playing loop: {e}")
-                break
+        except Exception as e:
+            print(f"Error playing loop: {e}")
+            self.is_playing_loop = False
     
     def stop_loop(self):
         """עצירת הלולאה"""
