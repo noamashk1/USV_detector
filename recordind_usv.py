@@ -208,16 +208,25 @@ class RecordingApp:
             loop_count = 0
             while self.is_playing_loop and self.is_recording:
                 # Play human tone first so you can hear when new loop starts
+                # Check what device will be used
+                default_device = sd.query_devices(kind='output')
+                print(f"Playing human tone through: {default_device['name']}")
                 sd.play(human_tone, samplerate=44100)
                 sd.wait()
                 
                 loop_count += 1
-                print(f"Starting USV loop #{loop_count}")
+                print(f"Starting USV loop #{loop_count}, playback device: {default_device['name']}")
                 
-                # Play ultrasonic audio
-                # Don't use device parameter to avoid ALSA conflicts during recording
-                # The default device will be used which should work with duplex mode
-                sd.play(self.loop_audio_data, samplerate=self.loop_fs)
+                # Play ultrasonic audio on Scarlett device
+                # Use device for playback since recording uses default device
+                if self.playback_device is not None:
+                    try:
+                        sd.play(self.loop_audio_data, samplerate=self.loop_fs, device=self.playback_device)
+                    except sd.PortAudioError as e:
+                        print(f"Warning: Could not use Scarlett device ({e}), trying default device")
+                        sd.play(self.loop_audio_data, samplerate=self.loop_fs)
+                else:
+                    sd.play(self.loop_audio_data, samplerate=self.loop_fs)
                 
                 # Wait for playback to finish
                 sd.wait()
