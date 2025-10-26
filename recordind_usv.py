@@ -1,6 +1,7 @@
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
+from scipy import signal
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import matplotlib.pyplot as plt
@@ -129,12 +130,25 @@ class RecordingApp:
         
         try:
             # Load the loop audio file
-            self.loop_fs, self.loop_audio_data = wav.read(self.loop_audio_file)
+            file_fs, self.loop_audio_data = wav.read(self.loop_audio_file)
+            
             # Convert to float32
             if self.loop_audio_data.dtype == np.int16:
                 self.loop_audio_data = self.loop_audio_data.astype(np.float32) / 32767.0
             elif self.loop_audio_data.dtype == np.int32:
                 self.loop_audio_data = self.loop_audio_data.astype(np.float32) / 2147483647.0
+            
+            # Resample to target sample rate (192000 Hz by default)
+            target_fs = 192000
+            if file_fs != target_fs:
+                # Calculate number of samples for resampling
+                num_samples = int(len(self.loop_audio_data) * target_fs / file_fs)
+                # Resample using scipy signal
+                self.loop_audio_data = signal.resample(self.loop_audio_data, num_samples)
+                self.loop_fs = target_fs
+                print(f"Loop audio resampled from {file_fs} Hz to {target_fs} Hz")
+            else:
+                self.loop_fs = file_fs
             
             print(f"Loop audio loaded: {self.loop_fs} Hz, {len(self.loop_audio_data)/self.loop_fs:.2f}s")
         except Exception as e:
@@ -143,7 +157,7 @@ class RecordingApp:
     
     def play_loop(self):
         """ניגון הלולאה ברקע"""
-        if not self.loop_audio_data:
+        if self.loop_audio_data is None:
             return
         
         self.is_playing_loop = True
