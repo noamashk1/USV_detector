@@ -3,7 +3,6 @@ from tkinter import messagebox, filedialog
 import threading
 import sounddevice as sd
 import numpy as np
-import lgpio
 import time
 import librosa
 import matplotlib.pyplot as plt
@@ -357,7 +356,7 @@ class UltrasonicDetectorApp:
 
 
 root = tk.Tk()
-root.geometry("600x700")  # הגדלת החלון לניתוח קבצים
+root.geometry("600x900")  # הגדלת החלון לניתוח קבצים
 root.title("Ultrasonic File Analyzer")
 app = UltrasonicDetectorApp(root)
 root.mainloop()

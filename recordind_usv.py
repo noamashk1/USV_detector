@@ -132,11 +132,11 @@ class RecordingApp:
     def record_audio(self):
         """הקלטת אודיו"""
         try:
-print("Recording..")
+            print("Recording..")
             self.recording_data = sd.rec(int(self.fs * self.duration), 
                                        samplerate=self.fs, channels=1, dtype='float32')
-sd.wait()
-print("Done")
+            sd.wait()
+            print("Done")
 
             # Update GUI
             self.master.after(0, self.recording_finished)
@@ -282,3 +282,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = RecordingApp(root)
     root.mainloop()
+
