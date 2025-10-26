@@ -31,8 +31,9 @@ class RecordingApp:
         self.view_duration = 10.0  # seconds to display
         self.current_start_time = 0.0
         
-        # Load loop audio file
+        # Load loop audio files
         self.load_loop_audio()
+        self.load_two_kicks_audio()
         
         # Detect Scarlett device for playback
         self.detect_audio_device()
@@ -184,30 +185,65 @@ class RecordingApp:
             self.loop_audio_data = None
             print(f"Error loading loop audio: {e}")
     
+    def load_two_kicks_audio(self):
+        """טעינת קובץ two_kicks.wav"""
+        self.two_kicks_file = "two_kicks.wav"
+        if not os.path.exists(self.two_kicks_file):
+            self.two_kicks_data = None
+            print(f"Warning: Two kicks audio file '{self.two_kicks_file}' not found")
+            return
+        
+        try:
+            # Load using soundfile
+            self.two_kicks_data, two_kicks_fs = sf.read(self.two_kicks_file)
+            print(f"Loaded two_kicks: {two_kicks_fs} Hz")
+            
+            # Resample to match loop fs (192000 Hz)
+            target_fs = 192000
+            if two_kicks_fs != target_fs:
+                factor = target_fs / two_kicks_fs
+                num_samples = int(len(self.two_kicks_data) * factor)
+                print(f"Resampling two_kicks from {two_kicks_fs} Hz to {target_fs} Hz")
+                self.two_kicks_data = signal.resample(self.two_kicks_data, num_samples)
+                self.two_kicks_fs = target_fs
+            else:
+                self.two_kicks_fs = two_kicks_fs
+            
+            print(f"Two kicks ready: {self.two_kicks_fs} Hz, {len(self.two_kicks_data)/self.two_kicks_fs:.2f}s")
+        except Exception as e:
+            self.two_kicks_data = None
+            print(f"Error loading two_kicks audio: {e}")
+    
     def play_loop(self):
         """ניגון הלולאה ברקע"""
         if self.loop_audio_data is None:
             print("Loop audio data is None!")
             return
         
-        print(f"Starting loop playback at {self.loop_fs} Hz...")
+        print(f"Starting loop playback...")
         self.is_playing_loop = True
         
         try:
-            # Use loop=True to avoid conflicts
-            # Use the same device as good_play_usv.py for Scarlett output
-            if self.playback_device is not None:
-                print(f"Using Scarlett device {self.playback_device} for playback")
-                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True, device=self.playback_device)
-            else:
-                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
-            print("Playback started with loop=True")
-            
-            # Wait while recording is active
+            loop_count = 0
             while self.is_playing_loop and self.is_recording:
-                import time
-                time.sleep(0.1)  # Check every 100ms
-                    
+                loop_count += 1
+                print(f"Starting loop #{loop_count}")
+                
+                # Play USV audio
+                if self.playback_device is not None:
+                    sd.play(self.loop_audio_data, samplerate=self.loop_fs, device=self.playback_device)
+                else:
+                    sd.play(self.loop_audio_data, samplerate=self.loop_fs)
+                sd.wait()
+                
+                # Play two_kicks.wav if available
+                if self.two_kicks_data is not None:
+                    if self.playback_device is not None:
+                        sd.play(self.two_kicks_data, samplerate=self.two_kicks_fs, device=self.playback_device)
+                    else:
+                        sd.play(self.two_kicks_data, samplerate=self.two_kicks_fs)
+                    sd.wait()
+            
             print("Loop playback stopped")
         except Exception as e:
             print(f"Error playing loop: {e}")
