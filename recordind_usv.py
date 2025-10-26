@@ -158,14 +158,24 @@ class RecordingApp:
     def play_loop(self):
         """ניגון הלולאה ברקע"""
         if self.loop_audio_data is None:
+            print("Loop audio data is None!")
             return
         
+        print(f"Starting loop playback at {self.loop_fs} Hz...")
         self.is_playing_loop = True
+        
         try:
-            sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
             # Keep playing while recording
             while self.is_playing_loop and self.is_recording:
+                sd.play(self.loop_audio_data, samplerate=self.loop_fs)
+                # Wait for playback to finish (or be interrupted)
                 sd.wait()
+                
+                # If we're still recording and should still be playing, continue
+                if not self.is_playing_loop or not self.is_recording:
+                    break
+                    
+            print("Loop playback stopped")
         except Exception as e:
             print(f"Error playing loop: {e}")
             self.is_playing_loop = False
@@ -189,12 +199,17 @@ class RecordingApp:
             status_msg = f"Recording for {self.duration} seconds..."
             if self.play_loop_var.get():
                 status_msg += " (with USV loop)"
+                print("Play loop enabled!")
+                if self.loop_audio_data is None:
+                    print("WARNING: Loop audio data is None but checkbox is checked!")
             self.status_label.config(text=status_msg)
             
             # Start playing loop if enabled
             if self.play_loop_var.get() and self.loop_audio_data is not None:
+                print("Starting loop thread...")
                 self.loop_thread = threading.Thread(target=self.play_loop, daemon=True)
                 self.loop_thread.start()
+                print("Loop thread started!")
             
             # Start recording in separate thread
             self.recording_thread = threading.Thread(target=self.record_audio, daemon=True)
