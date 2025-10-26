@@ -184,6 +184,12 @@ class RecordingApp:
             self.loop_audio_data = None
             print(f"Error loading loop audio: {e}")
     
+    def create_human_tone(self, frequency=1000, duration=0.2, fs=44100):
+        """יצירת צליל בן אדם (200ms, 1000 Hz)"""
+        t = np.linspace(0, duration, int(fs * duration))
+        tone = np.sin(2 * np.pi * frequency * t)
+        return tone.astype(np.float32)
+    
     def play_loop(self):
         """ניגון הלולאה ברקע"""
         if self.loop_audio_data is None:
@@ -191,22 +197,32 @@ class RecordingApp:
             return
         
         print(f"Starting loop playback at {self.loop_fs} Hz...")
+        
+        # Create human-audible tone (200ms, 1000Hz at 44.1kHz)
+        human_tone = self.create_human_tone(frequency=1000, duration=0.2, fs=44100)
+        
         self.is_playing_loop = True
         
         try:
-            # Use loop=True to avoid conflicts
             # Use the same device as good_play_usv.py for Scarlett output
-            if self.playback_device is not None:
-                print(f"Using Scarlett device {self.playback_device} for playback")
-                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True, device=self.playback_device)
-            else:
-                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
-            print("Playback started with loop=True")
-            
-            # Wait while recording is active
+            loop_count = 0
             while self.is_playing_loop and self.is_recording:
-                import time
-                time.sleep(0.1)  # Check every 100ms
+                # Play human tone first so you can hear when new loop starts
+                sd.play(human_tone, samplerate=44100)
+                sd.wait()
+                
+                loop_count += 1
+                print(f"Starting USV loop #{loop_count}")
+                
+                # Play ultrasonic audio
+                if self.playback_device is not None:
+                    print(f"Using Scarlett device {self.playback_device} for playback")
+                    sd.play(self.loop_audio_data, samplerate=self.loop_fs, device=self.playback_device)
+                else:
+                    sd.play(self.loop_audio_data, samplerate=self.loop_fs)
+                
+                # Wait for playback to finish
+                sd.wait()
                     
             print("Loop playback stopped")
         except Exception as e:
