@@ -215,11 +215,9 @@ class RecordingApp:
                 print(f"Starting USV loop #{loop_count}")
                 
                 # Play ultrasonic audio
-                if self.playback_device is not None:
-                    print(f"Using Scarlett device {self.playback_device} for playback")
-                    sd.play(self.loop_audio_data, samplerate=self.loop_fs, device=self.playback_device)
-                else:
-                    sd.play(self.loop_audio_data, samplerate=self.loop_fs)
+                # Don't use device parameter to avoid ALSA conflicts during recording
+                # The default device will be used which should work with duplex mode
+                sd.play(self.loop_audio_data, samplerate=self.loop_fs)
                 
                 # Wait for playback to finish
                 sd.wait()
