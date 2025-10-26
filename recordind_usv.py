@@ -1,6 +1,7 @@
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
+import soundfile as sf
 from scipy import signal
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -23,6 +24,7 @@ class RecordingApp:
         self.recording_data = None
         self.is_recording = False
         self.is_playing_loop = False  # Flag to control loop playback
+        self.playback_device = None  # Audio device for playback
         
         # Visualization parameters
         self.view_duration = 10.0  # seconds to display
@@ -30,6 +32,9 @@ class RecordingApp:
         
         # Load loop audio file
         self.load_loop_audio()
+        
+        # Detect Scarlett device for playback
+        self.detect_audio_device()
         
         # GUI setup
         self.setup_gui()
@@ -120,6 +125,19 @@ class RecordingApp:
         # Initial empty plot
         self.update_plot()
     
+    def detect_audio_device(self):
+        """זיהוי כרטיס Scarlett להשמעה"""
+        try:
+            devices = sd.query_devices()
+            for i, device in enumerate(devices):
+                if "Scarlett" in device["name"] and device["max_output_channels"] > 0:
+                    self.playback_device = i
+                    print(f"Found Scarlett device: {device['name']} (index {i})")
+                    return
+            print("Warning: Scarlett device not found, using default device")
+        except Exception as e:
+            print(f"Error detecting audio device: {e}")
+    
     def load_loop_audio(self):
         """טעינת קובץ הלולאה"""
         self.loop_audio_file = "pup ICR USVs.wav"
@@ -129,28 +147,24 @@ class RecordingApp:
             return
         
         try:
-            # Load the loop audio file
-            file_fs, self.loop_audio_data = wav.read(self.loop_audio_file)
+            # Load the loop audio file using soundfile (works better than wav.read)
+            self.loop_audio_data, file_fs = sf.read(self.loop_audio_file)
+            print(f"Loaded audio file: {file_fs} Hz")
             
-            # Convert to float32
-            if self.loop_audio_data.dtype == np.int16:
-                self.loop_audio_data = self.loop_audio_data.astype(np.float32) / 32767.0
-            elif self.loop_audio_data.dtype == np.int32:
-                self.loop_audio_data = self.loop_audio_data.astype(np.float32) / 2147483647.0
-            
-            # Resample to target sample rate (192000 Hz by default)
+            # Resample if file fs is greater than target fs
             target_fs = 192000
-            if file_fs != target_fs:
-                # Calculate number of samples for resampling
-                num_samples = int(len(self.loop_audio_data) * target_fs / file_fs)
-                # Resample using scipy signal
+            if file_fs > target_fs:
+                # Calculate resampling factor
+                factor = target_fs / file_fs
+                num_samples = int(len(self.loop_audio_data) * factor)
+                print(f"Resampling from {file_fs} Hz to {target_fs} Hz ({factor:.2f}x slower)")
                 self.loop_audio_data = signal.resample(self.loop_audio_data, num_samples)
                 self.loop_fs = target_fs
-                print(f"Loop audio resampled from {file_fs} Hz to {target_fs} Hz")
             else:
                 self.loop_fs = file_fs
+                print(f"No resampling needed: {file_fs} Hz")
             
-            print(f"Loop audio loaded: {self.loop_fs} Hz, {len(self.loop_audio_data)/self.loop_fs:.2f}s")
+            print(f"Loop audio ready: {self.loop_fs} Hz, {len(self.loop_audio_data)/self.loop_fs:.2f}s")
         except Exception as e:
             self.loop_audio_data = None
             print(f"Error loading loop audio: {e}")
@@ -162,16 +176,21 @@ class RecordingApp:
             return
         
         print(f"Starting loop playback at {self.loop_fs} Hz...")
+        if self.playback_device is not None:
+            print(f"Using device index: {self.playback_device}")
         self.is_playing_loop = True
         
         try:
             # Keep playing while recording
             while self.is_playing_loop and self.is_recording:
-                sd.play(self.loop_audio_data, samplerate=self.loop_fs)
-                # Wait for playback to finish (or be interrupted)
+                if self.playback_device is not None:
+                    sd.play(self.loop_audio_data, samplerate=self.loop_fs, device=self.playback_device)
+                else:
+                    sd.play(self.loop_audio_data, samplerate=self.loop_fs)
+                # Wait for playback to finish
                 sd.wait()
                 
-                # If we're still recording and should still be playing, continue
+                # Check if we should continue
                 if not self.is_playing_loop or not self.is_recording:
                     break
                     
