@@ -25,6 +25,7 @@ class RecordingApp:
         self.is_recording = False
         self.is_playing_loop = False  # Flag to control loop playback
         self.playback_device = None  # Audio device for playback
+        self.record_device = None  # Audio device for recording
         
         # Visualization parameters
         self.view_duration = 10.0  # seconds to display
@@ -126,18 +127,24 @@ class RecordingApp:
         self.update_plot()
     
     def detect_audio_device(self):
-        """זיהוי כרטיס Scarlett להשמעה"""
+        """זיהוי כרטיס Scarlett להשמעה והקלטה"""
         try:
             devices = sd.query_devices()
             print("\nAvailable audio devices:")
             for i, device in enumerate(devices):
                 print(f"  {i}: {device['name']} (inputs: {device['max_input_channels']}, outputs: {device['max_output_channels']})")
-                if "Scarlett" in device["name"] and device["max_output_channels"] > 0:
-                    self.playback_device = i
-                    print(f"Found Scarlett device: {device['name']} (index {i})")
+                if "Scarlett" in device["name"]:
+                    if device["max_output_channels"] > 0:
+                        self.playback_device = i
+                        print(f"Found Scarlett output device: {device['name']} (index {i})")
+                    if device["max_input_channels"] > 0:
+                        self.record_device = i
+                        print(f"Found Scarlett input device: {device['name']} (index {i})")
             print()
             if self.playback_device is None:
-                print("Warning: Scarlett device not found, using default device")
+                print("Warning: Scarlett output device not found, using default device")
+            if self.record_device is None:
+                print("Warning: Scarlett input device not found, using default device")
         except Exception as e:
             print(f"Error detecting audio device: {e}")
     
@@ -188,7 +195,12 @@ class RecordingApp:
         
         try:
             # Use loop=True to avoid conflicts
-            sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
+            # Use the same device as good_play_usv.py for Scarlett output
+            if self.playback_device is not None:
+                print(f"Using Scarlett device {self.playback_device} for playback")
+                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True, device=self.playback_device)
+            else:
+                sd.play(self.loop_audio_data, samplerate=self.loop_fs, loop=True)
             print("Playback started with loop=True")
             
             # Wait while recording is active
@@ -247,6 +259,9 @@ class RecordingApp:
             print("Recording..")
             # Use InputStream to allow simultaneous playback
             frames = int(self.fs * self.duration)
+            # Don't specify device for input - let ALSA/PulseAudio handle duplex
+            # This avoids "device busy" conflicts when playback is on the same device
+            print(f"Recording from default input device (Scarlett will be used if available)")
             with sd.InputStream(samplerate=self.fs, channels=1, dtype='float32', blocksize=4096) as stream:
                 self.recording_data = np.zeros((frames,), dtype='float32')
                 total_read = 0
@@ -258,6 +273,18 @@ class RecordingApp:
                         print(f"Warning: buffer overflow during recording")
                     self.recording_data[total_read:total_read+len(data)] = data[:, 0]
                     total_read += len(data)
+                    # Print RMS every 5 seconds to verify ultrasonic detection
+                    if total_read % (self.fs * 5) < 4096:
+                        chunk_rms = np.sqrt(np.mean(self.recording_data[max(0, total_read-self.fs):total_read]**2))
+                        # Check ultrasonic frequencies (70+ kHz)
+                        fft = np.fft.rfft(self.recording_data[max(0, total_read-self.fs):total_read])
+                        freqs = np.fft.rfftfreq(len(fft)*2-2, 1/self.fs)
+                        usv_mask = freqs >= 70000
+                        if len(fft[usv_mask]) > 0:
+                            usv_rms = np.sqrt(np.mean(np.abs(fft[usv_mask])**2))
+                            print(f"Recording progress: {total_read/frames*100:.0f}% - RMS: {chunk_rms:.4f}, USV RMS: {usv_rms:.2f}")
+                        else:
+                            print(f"Recording progress: {total_read/frames*100:.0f}% - RMS: {chunk_rms:.4f}, USV: not detected")
             print("Done")
 
             # Update GUI
