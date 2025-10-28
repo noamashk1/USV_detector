@@ -11,12 +11,15 @@ from matplotlib.figure import Figure
 import threading
 import os
 import wave
+# cat /proc/asound/card2/pcm0c/sub0/hw_params
+# cat /proc/asound/card2/pcm0p/sub0/hw_params
 
 class RecordingApp:
     def __init__(self, master):
         self.master = master
         master.title("USV Recording & Visualization")
         master.geometry("1000x700")
+        sd.default.samplerate =192000
         
         # Recording parameters
         self.fs = 192000
