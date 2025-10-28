@@ -163,7 +163,7 @@ class RecordingApp:
             print(f"Loaded audio file: {file_fs} Hz")
             
             # Amplify the audio (x2 for louder playback)
-            amplification = 2.0
+            amplification = 5.0
             self.loop_audio_data = self.loop_audio_data * amplification
             # Clip to prevent overflow
             self.loop_audio_data = np.clip(self.loop_audio_data, -1.0, 1.0)
@@ -205,7 +205,7 @@ class RecordingApp:
             print(f"Loaded two_kicks: {two_kicks_fs} Hz")
             
             # Amplify the audio (x3 for two_kicks since it's quieter)
-            amplification = 3.0
+            amplification = 20.0
             self.two_kicks_data = self.two_kicks_data * amplification
             # Clip to prevent overflow
             self.two_kicks_data = np.clip(self.two_kicks_data, -1.0, 1.0)
