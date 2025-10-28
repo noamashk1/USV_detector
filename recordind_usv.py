@@ -19,7 +19,9 @@ class RecordingApp:
         self.master = master
         master.title("USV Recording & Visualization")
         master.geometry("1000x700")
-        sd.default.samplerate =192000
+        
+        # Set default sample rate for sounddevice
+        sd.default.samplerate = 192000
         
         # Recording parameters
         self.fs = 192000
@@ -40,6 +42,14 @@ class RecordingApp:
         
         # Detect Scarlett device for playback
         self.detect_audio_device()
+        
+        # If devices were detected, set as defaults and enforce 192kHz
+        try:
+            if self.record_device is not None or self.playback_device is not None:
+                sd.default.device = (self.record_device, self.playback_device)
+            sd.default.samplerate = 192000
+        except Exception as e:
+            print(f"Warning: Failed setting default devices/samplerate: {e}")
         
         # GUI setup
         self.setup_gui()
@@ -308,12 +318,29 @@ class RecordingApp:
         """הקלטת אודיו"""
         try:
             print("Recording..")
-            # Use InputStream to allow simultaneous playback
+            # Enforce 192kHz and explicit device for recording
+            self.fs = 192000
             frames = int(self.fs * self.duration)
-            # Don't specify device for input - let ALSA/PulseAudio handle duplex
-            # This avoids "device busy" conflicts when playback is on the same device
-            print(f"Recording from default input device (Scarlett will be used if available)")
-            with sd.InputStream(samplerate=self.fs, channels=1, dtype='float32', blocksize=4096) as stream:
+            
+            # Validate input settings if possible
+            try:
+                sd.check_input_settings(device=self.record_device, samplerate=self.fs, channels=1)
+            except Exception as e:
+                print(f"Warning: check_input_settings failed: {e}")
+            
+            stream_kwargs = {
+                'samplerate': self.fs,
+                'channels': 1,
+                'dtype': 'float32',
+                'blocksize': 4096
+            }
+            if self.record_device is not None:
+                stream_kwargs['device'] = self.record_device
+                print(f"Recording from Scarlett device {self.record_device} at {self.fs} Hz")
+            else:
+                print(f"Recording from default input device at {self.fs} Hz")
+            
+            with sd.InputStream(**stream_kwargs) as stream:
                 self.recording_data = np.zeros((frames,), dtype='float32')
                 total_read = 0
                 while total_read < frames:
@@ -324,18 +351,6 @@ class RecordingApp:
                         print(f"Warning: buffer overflow during recording")
                     self.recording_data[total_read:total_read+len(data)] = data[:, 0]
                     total_read += len(data)
-                    # Print RMS every 5 seconds to verify ultrasonic detection
-                    if total_read % (self.fs * 5) < 4096:
-                        chunk_rms = np.sqrt(np.mean(self.recording_data[max(0, total_read-self.fs):total_read]**2))
-                        # Check ultrasonic frequencies (70+ kHz)
-                        fft = np.fft.rfft(self.recording_data[max(0, total_read-self.fs):total_read])
-                        freqs = np.fft.rfftfreq(len(fft)*2-2, 1/self.fs)
-                        usv_mask = freqs >= 70000
-                        if len(fft[usv_mask]) > 0:
-                            usv_rms = np.sqrt(np.mean(np.abs(fft[usv_mask])**2))
-                            print(f"Recording progress: {total_read/frames*100:.0f}% - RMS: {chunk_rms:.4f}, USV RMS: {usv_rms:.2f}")
-                        else:
-                            print(f"Recording progress: {total_read/frames*100:.0f}% - RMS: {chunk_rms:.4f}, USV: not detected")
             print("Done")
 
             # Update GUI
