@@ -108,6 +108,16 @@ class UltrasonicDetectorApp:
         self.canvas = FigureCanvasTkAgg(self.fig, self.viz_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
+        # Spectrogram tab
+        self.spec_frame = tk.Frame(self.notebook)
+        self.notebook.add(self.spec_frame, text="Spectrogram")
+        
+        # Create matplotlib figure for spectrogram
+        self.fig_spec, self.ax_spec = plt.subplots(figsize=(10, 6))
+        self.canvas_spec = FigureCanvasTkAgg(self.fig_spec, self.spec_frame)
+        self.canvas_spec.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.colorbar_spec = None  # Reference to colorbar to avoid duplicates
+        
         # Progress bar
         self.progress_var = tk.DoubleVar()
         self.progress_bar = tk.Scale(master, from_=0, to=100, orient=tk.HORIZONTAL, 
@@ -139,6 +149,9 @@ class UltrasonicDetectorApp:
                 # הצגת מידע על הקובץ
                 duration = len(self.audio_data) / self.sample_rate
                 self.status_label.config(text=f"File loaded: {duration:.2f}s, {self.sample_rate}Hz")
+                
+                # יצירת ספקטרוגרמה
+                self.create_spectrogram()
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load file:\n{str(e)}")
@@ -225,6 +238,7 @@ class UltrasonicDetectorApp:
             self.status_label.config(text="Status: Analysis complete - No USV detected")
             self.progress_bar.config(state=tk.DISABLED)
             self.create_visualization()  # עדיין ניצור גרף גם אם אין זיהויים
+            self.create_spectrogram()  # עדכון הספקטרוגרמה גם אם אין זיהויים
             return
         
         # הצגת התוצאות
@@ -246,6 +260,9 @@ class UltrasonicDetectorApp:
         
         # יצירת הוויזואליזציה
         self.create_visualization()
+        
+        # עדכון הספקטרוגרמה עם סימון זיהויים
+        self.create_spectrogram()
 
     def create_visualization(self):
         """יצירת ויזואליזציה של האודיו עם סימון זיהויי USV"""
@@ -295,6 +312,111 @@ class UltrasonicDetectorApp:
         
         # רענון הקנבס
         self.canvas.draw()
+
+    def create_spectrogram(self):
+        """יצירת ספקטרוגרמה של הקובץ הגולמי"""
+        if self.audio_data is None or self.sample_rate is None:
+            # ניקוי הגרף אם אין נתונים
+            self.ax_spec.clear()
+            if self.colorbar_spec is not None:
+                try:
+                    self.colorbar_spec.remove()
+                except:
+                    pass
+                self.colorbar_spec = None
+            self.ax_spec.set_title("No audio data - Load a WAV file")
+            self.ax_spec.set_xlabel('Time (seconds)')
+            self.ax_spec.set_ylabel('Frequency (Hz)')
+            self.canvas_spec.draw()
+            return
+        
+        try:
+            # ניקוי הגרף הקודם - הסרת כל ה-axes מה-figure (כולל colorbar)
+            # זה מבטיח שלא יהיו colorbars כפולים
+            for ax in self.fig_spec.axes:
+                ax.remove()
+            
+            # יצירת axes חדש
+            self.ax_spec = self.fig_spec.add_subplot(111)
+            self.colorbar_spec = None
+            
+            # חישוב הספקטרוגרמה באמצעות librosa
+            # n_fft: גודל חלון FFT (2048 דוגמאות = ~10ms ב-192kHz)
+            # hop_length: מרחק בין חלונות (512 דוגמאות = ~2.7ms ב-192kHz)
+            n_fft = 2048
+            hop_length = 512
+            
+            # חישוב STFT (Short-Time Fourier Transform)
+            stft = librosa.stft(self.audio_data, n_fft=n_fft, hop_length=hop_length)
+            
+            # המרה לעוצמה בדציבל
+            magnitude = np.abs(stft)
+            spectrogram_db = librosa.amplitude_to_db(magnitude, ref=np.max)
+            
+            # חישוב צירי הזמן והתדר
+            duration = len(self.audio_data) / self.sample_rate
+            times = librosa.frames_to_time(np.arange(spectrogram_db.shape[1]), 
+                                          sr=self.sample_rate, 
+                                          hop_length=hop_length)
+            freqs = librosa.fft_frequencies(sr=self.sample_rate, n_fft=n_fft)
+            
+            # הצגת הספקטרוגרמה
+            im = self.ax_spec.imshow(spectrogram_db, aspect='auto', origin='lower',
+                                    extent=[times[0], times[-1], freqs[0], freqs[-1]],
+                                    cmap='viridis', interpolation='bilinear')
+            
+            # הוספת colorbar חדש
+            self.colorbar_spec = self.fig_spec.colorbar(im, ax=self.ax_spec, label='Magnitude (dB)')
+            
+            # סימון זיהויי USV אם יש
+            if self.detection_results:
+                for i, detection in enumerate(self.detection_results):
+                    start_time = detection['start_time']
+                    end_time = detection['end_time']
+                    
+                    # סימון אזור הזיהוי עם קו אנכי
+                    self.ax_spec.axvline(start_time, color='red', linestyle='--', 
+                                       linewidth=1.5, alpha=0.7)
+                    self.ax_spec.axvline(end_time, color='red', linestyle='--', 
+                                       linewidth=1.5, alpha=0.7)
+                    
+                    # הוספת מספר זיהוי
+                    mid_time = (start_time + end_time) / 2
+                    max_freq = min(freqs[-1], detection.get('max_freq', freqs[-1]/2))
+                    self.ax_spec.text(mid_time, max_freq, f'{i+1}', 
+                                    ha='center', va='center', fontsize=10, 
+                                    fontweight='bold', color='yellow',
+                                    bbox=dict(boxstyle='circle', facecolor='red', 
+                                            alpha=0.7, edgecolor='yellow'))
+            
+            # הגדרת הגרף
+            self.ax_spec.set_xlabel('Time (seconds)')
+            self.ax_spec.set_ylabel('Frequency (Hz)')
+            self.ax_spec.set_title('Spectrogram - Raw WAV File')
+            self.ax_spec.set_xlim(0, duration)
+            
+            # התמקדות בתדרים רלוונטיים (0 עד מקסימום התדר, או עד 100kHz אם יש תדרים אולטרסוניים)
+            max_freq_display = min(freqs[-1], 100000)  # עד 100kHz
+            self.ax_spec.set_ylim(0, max_freq_display)
+            
+            # רענון הקנבס
+            self.canvas_spec.draw()
+            
+        except Exception as e:
+            # במקרה של שגיאה, הצגת הודעת שגיאה
+            # וידוא שיש axes תקין
+            if not hasattr(self, 'ax_spec') or self.ax_spec not in self.fig_spec.axes:
+                # יצירת axes חדש אם אין
+                self.ax_spec = self.fig_spec.add_subplot(111)
+            else:
+                self.ax_spec.clear()
+            self.ax_spec.set_title(f"Error creating spectrogram: {str(e)}")
+            self.ax_spec.set_xlabel('Time (seconds)')
+            self.ax_spec.set_ylabel('Frequency (Hz)')
+            self.canvas_spec.draw()
+            print(f"Error creating spectrogram: {e}")
+            import traceback
+            traceback.print_exc()
 
     def play_detection(self):
         """השמעת החלקים שזוהו כ-USV"""
