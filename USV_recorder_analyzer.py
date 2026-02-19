@@ -605,10 +605,7 @@ class USVRecorderAnalyzer:
                 for i, detection in enumerate(self.detection_results):
                     start_time = detection['start_time']
                     end_time = detection['end_time']
-                    self.ax_spec.axvline(start_time, color='red', linestyle='--', 
-                                       linewidth=1.5, alpha=0.7)
-                    self.ax_spec.axvline(end_time, color='red', linestyle='--', 
-                                       linewidth=1.5, alpha=0.7)
+                    # Only show circles, no vertical lines
                     mid_time = (start_time + end_time) / 2
                     max_freq = min(freqs[-1], detection.get('max_freq', freqs[-1]/2))
                     self.ax_spec.text(mid_time, max_freq, f'{i+1}', 

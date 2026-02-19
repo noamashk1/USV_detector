@@ -374,13 +374,7 @@ class UltrasonicDetectorApp:
                     start_time = detection['start_time']
                     end_time = detection['end_time']
                     
-                    # סימון אזור הזיהוי עם קו אנכי
-                    self.ax_spec.axvline(start_time, color='red', linestyle='--', 
-                                       linewidth=1.5, alpha=0.7)
-                    self.ax_spec.axvline(end_time, color='red', linestyle='--', 
-                                       linewidth=1.5, alpha=0.7)
-                    
-                    # הוספת מספר זיהוי
+                    # הוספת מספר זיהוי (רק עיגולים, ללא קווים אנכיים)
                     mid_time = (start_time + end_time) / 2
                     max_freq = min(freqs[-1], detection.get('max_freq', freqs[-1]/2))
                     self.ax_spec.text(mid_time, max_freq, f'{i+1}', 
