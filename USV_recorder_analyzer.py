@@ -129,8 +129,6 @@ class USVRecorderAnalyzer:
         
         # GUI variables
         self.threshold_var = tk.DoubleVar(value=0.2)
-        self.gpio_var = tk.IntVar(value=17)
-        self.ttl_duration_var = tk.DoubleVar(value=0.05)
         self.min_freq_khz_var = tk.DoubleVar(value=30.0)
         self.window_size_ms_var = tk.DoubleVar(value=100.0)
         self.hop_overlap_var = tk.DoubleVar(value=50.0)
@@ -147,146 +145,107 @@ class USVRecorderAnalyzer:
         self.setup_gui()
         
     def setup_gui(self):
-        """Setup the GUI layout"""
+        """Setup the GUI layout - single page like USV.py"""
         # Title
-        tk.Label(self.master, text="USV Recorder & Analyzer", 
+        tk.Label(self.master, text="USV Recorder & Analyzer",
                 font=("Arial", 16, "bold")).pack(pady=10)
         
-        # Create notebook for tabs
-        self.notebook_main = ttk.Notebook(self.master)
-        self.notebook_main.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # --- Top section: Recording / Load ---
+        top_frame = tk.Frame(self.master)
+        top_frame.pack(pady=5, fill=tk.X)
         
-        # Recording tab
-        self.recording_frame = tk.Frame(self.notebook_main)
-        self.notebook_main.add(self.recording_frame, text="Recording")
-        self.setup_recording_tab()
-        
-        # Analysis tab
-        self.analysis_frame = tk.Frame(self.notebook_main)
-        self.notebook_main.add(self.analysis_frame, text="Analysis")
-        self.setup_analysis_tab()
-        
-        # Results tab
-        self.results_frame = tk.Frame(self.notebook_main)
-        self.notebook_main.add(self.results_frame, text="Results")
-        self.setup_results_tab()
-        
-        # Status bar
-        self.status_label = tk.Label(self.master, text="Status: Ready", 
-                                    font=("Arial", 10, "bold"), relief=tk.SUNKEN, anchor=tk.W)
-        self.status_label.pack(fill=tk.X, side=tk.BOTTOM)
-        
-    def setup_recording_tab(self):
-        """Setup recording tab"""
         # Microphone info
-        info_frame = tk.LabelFrame(self.recording_frame, text="Microphone Info", padx=10, pady=5)
-        info_frame.pack(pady=10, padx=10, fill=tk.X)
+        info_frame = tk.LabelFrame(top_frame, text="Microphone Info", padx=10, pady=5)
+        info_frame.pack(pady=5, fill=tk.X)
         
         if self.recorder.device_index is not None:
-            tk.Label(info_frame, text=f"Device: {self.recorder.device_name}", 
+            tk.Label(info_frame, text=f"Device: {self.recorder.device_name}",
                     font=("Arial", 10)).pack(anchor=tk.W)
-            tk.Label(info_frame, text=f"Sample Rate: {self.recorder.sample_rate} Hz", 
+            tk.Label(info_frame, text=f"Sample Rate: {self.recorder.sample_rate} Hz",
                     font=("Arial", 10)).pack(anchor=tk.W)
         else:
-            tk.Label(info_frame, text="⚠️ Dodotronic microphone not found", 
+            tk.Label(info_frame, text="Dodotronic microphone not found",
                     fg="red", font=("Arial", 10)).pack(anchor=tk.W)
-            tk.Button(info_frame, text="Refresh Device List", 
+            tk.Button(info_frame, text="Refresh Device List",
                      command=self.refresh_device).pack(pady=5)
         
-        # Recording parameters
-        params_frame = tk.LabelFrame(self.recording_frame, text="Recording Parameters", padx=10, pady=5)
-        params_frame.pack(pady=10, padx=10, fill=tk.X)
+        # Recording + Load in one row
+        record_load_frame = tk.Frame(top_frame)
+        record_load_frame.pack(pady=5, fill=tk.X)
         
-        tk.Label(params_frame, text="Duration (seconds):").pack(anchor=tk.W)
-        tk.Entry(params_frame, textvariable=self.recording_duration_var, width=15).pack(anchor=tk.W, pady=2)
-        
-        # File selection
-        file_frame = tk.LabelFrame(self.recording_frame, text="File Selection", padx=10, pady=5)
-        file_frame.pack(pady=10, padx=10, fill=tk.X)
-        
-        self.file_label = tk.Label(file_frame, text="No file loaded", fg="red")
-        self.file_label.pack(pady=5)
-        
-        # Buttons
-        button_frame = tk.Frame(self.recording_frame)
-        button_frame.pack(pady=10)
-        
-        self.record_button = tk.Button(button_frame, text="Record", 
-                                      command=self.start_recording, width=15, height=2)
+        tk.Label(record_load_frame, text="Duration (sec):").pack(side=tk.LEFT, padx=(0, 5))
+        tk.Entry(record_load_frame, textvariable=self.recording_duration_var, width=10).pack(side=tk.LEFT, padx=5)
+        self.record_button = tk.Button(record_load_frame, text="Record",
+                                      command=self.start_recording, width=12)
         self.record_button.pack(side=tk.LEFT, padx=5)
         
-        tk.Button(button_frame, text="Load WAV File", 
-                 command=self.load_file, width=15).pack(side=tk.LEFT, padx=5)
+        tk.Label(record_load_frame, text="  |  Load WAV:").pack(side=tk.LEFT, padx=(15, 5))
+        tk.Button(record_load_frame, text="Browse WAV File", command=self.load_file, width=18).pack(side=tk.LEFT, padx=5)
+        self.save_recording_btn = tk.Button(record_load_frame, text="Save Recording", command=self.save_recording, width=15, state=tk.DISABLED)
+        self.save_recording_btn.pack(side=tk.LEFT, padx=5)
         
-        tk.Button(button_frame, text="Save Recording", 
-                 command=self.save_recording, width=15, state=tk.DISABLED).pack(side=tk.LEFT, padx=5)
+        # File / recording status (shows name and params after load or record)
+        self.file_label = tk.Label(top_frame, text="No file selected", fg="red")
+        self.file_label.pack(pady=5)
         
         # Progress bar
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = tk.Scale(self.recording_frame, from_=0, to=100, 
-                                    orient=tk.HORIZONTAL, variable=self.progress_var, 
-                                    length=400, state=tk.DISABLED)
-        self.progress_bar.pack(pady=10)
+        self.progress_bar = tk.Scale(top_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+                                    variable=self.progress_var, length=400, state=tk.DISABLED)
+        self.progress_bar.pack(pady=5)
         
-    def setup_analysis_tab(self):
-        """Setup analysis tab"""
-        # Analysis parameters
-        params_frame = tk.LabelFrame(self.analysis_frame, text="Analysis Parameters", padx=10, pady=5)
-        params_frame.pack(pady=10, padx=10, fill=tk.X)
+        # --- Analysis parameters (like USV.py) ---
+        params_frame = tk.Frame(self.master)
+        params_frame.pack(pady=10)
         
-        # Create grid for parameters
-        row = 0
-        tk.Label(params_frame, text="Ultrasonic Threshold (RMS):").grid(row=row, column=0, sticky=tk.W, pady=2)
-        tk.Entry(params_frame, textvariable=self.threshold_var, width=15).grid(row=row, column=1, pady=2)
-        row += 1
+        tk.Label(params_frame, text="Analysis Parameters", font=("Arial", 12, "bold")).pack()
         
-        tk.Label(params_frame, text="Min Frequency (kHz):").grid(row=row, column=0, sticky=tk.W, pady=2)
-        tk.Entry(params_frame, textvariable=self.min_freq_khz_var, width=15).grid(row=row, column=1, pady=2)
-        row += 1
+        tk.Label(params_frame, text="Ultrasonic Threshold (RMS):").pack(pady=5)
+        tk.Entry(params_frame, textvariable=self.threshold_var).pack(pady=2)
         
-        tk.Label(params_frame, text="Window Size (ms):").grid(row=row, column=0, sticky=tk.W, pady=2)
-        tk.Entry(params_frame, textvariable=self.window_size_ms_var, width=15).grid(row=row, column=1, pady=2)
-        row += 1
+        tk.Label(params_frame, text="Min Frequency (kHz):").pack(pady=5)
+        tk.Entry(params_frame, textvariable=self.min_freq_khz_var).pack(pady=2)
         
-        tk.Label(params_frame, text="Hop Overlap (%):").grid(row=row, column=0, sticky=tk.W, pady=2)
-        tk.Entry(params_frame, textvariable=self.hop_overlap_var, width=15).grid(row=row, column=1, pady=2)
-        row += 1
+        tk.Label(params_frame, text="Window Size (ms):").pack(pady=5)
+        tk.Entry(params_frame, textvariable=self.window_size_ms_var).pack(pady=2)
         
-        tk.Label(params_frame, text="GPIO Number:").grid(row=row, column=0, sticky=tk.W, pady=2)
-        tk.Entry(params_frame, textvariable=self.gpio_var, width=15).grid(row=row, column=1, pady=2)
-        row += 1
+        tk.Label(params_frame, text="Hop Overlap (%):").pack(pady=5)
+        tk.Entry(params_frame, textvariable=self.hop_overlap_var).pack(pady=2)
         
-        tk.Label(params_frame, text="TTL Duration (sec):").grid(row=row, column=0, sticky=tk.W, pady=2)
-        tk.Entry(params_frame, textvariable=self.ttl_duration_var, width=15).grid(row=row, column=1, pady=2)
+        # Control buttons
+        button_frame = tk.Frame(self.master)
+        button_frame.pack(pady=10)
         
-        # Analysis buttons
-        button_frame = tk.Frame(self.analysis_frame)
-        button_frame.pack(pady=20)
-        
-        self.analyze_button = tk.Button(button_frame, text="Analyze Audio", 
-                                        command=self.analyze_audio, width=20, height=2,
-                                        state=tk.DISABLED)
+        self.analyze_button = tk.Button(button_frame, text="Analyze Audio",
+                                        command=self.analyze_audio, width=15, state=tk.DISABLED)
         self.analyze_button.pack(side=tk.LEFT, padx=5)
         
-        self.play_button = tk.Button(button_frame, text="Play Detections", 
-                                    command=self.play_detection, width=20, state=tk.DISABLED)
+        self.play_button = tk.Button(button_frame, text="Play Detections",
+                                     command=self.play_detection, width=15, state=tk.DISABLED)
         self.play_button.pack(side=tk.LEFT, padx=5)
         
-        self.save_results_button = tk.Button(button_frame, text="Save Results", 
-                                           command=self.save_results, width=20, state=tk.DISABLED)
+        self.save_results_button = tk.Button(button_frame, text="Save Results",
+                                             command=self.save_results, width=15, state=tk.DISABLED)
         self.save_results_button.pack(side=tk.LEFT, padx=5)
         
-    def setup_results_tab(self):
-        """Setup results tab"""
-        # Create notebook for results sub-tabs
-        self.results_notebook = ttk.Notebook(self.results_frame)
-        self.results_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Status
+        self.status_label = tk.Label(self.master, text="Status: Ready", font=("Arial", 10, "bold"))
+        self.status_label.pack(pady=5)
         
-        # Text results tab
+        # --- Results: 3 tabs (Text, Visualization, Spectrogram) ---
+        results_frame = tk.Frame(self.master)
+        results_frame.pack(pady=10, fill=tk.BOTH, expand=True)
+        
+        tk.Label(results_frame, text="Analysis Results", font=("Arial", 12, "bold")).pack()
+        
+        self.results_notebook = ttk.Notebook(results_frame)
+        self.results_notebook.pack(pady=5, fill=tk.BOTH, expand=True)
+        
+        # Text Results tab
         text_frame = tk.Frame(self.results_notebook)
         self.results_notebook.add(text_frame, text="Text Results")
         
-        self.results_text = tk.Text(text_frame, height=15, width=70)
+        self.results_text = tk.Text(text_frame, height=8, width=60)
         scrollbar = tk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.results_text.yview)
         self.results_text.configure(yscrollcommand=scrollbar.set)
         self.results_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -372,8 +331,9 @@ class USVRecorderAnalyzer:
         # Enable analyze button
         self.analyze_button.config(state=tk.NORMAL)
         
-        # Update file label
-        self.file_label.config(text=f"Recording: {duration:.2f}s @ {self.sample_rate}Hz", fg="green")
+        # Update file label with params
+        self.file_label.config(text=f"Recording: {duration:.2f}s, {self.sample_rate} Hz", fg="green")
+        self.save_recording_btn.config(state=tk.NORMAL)
         
         # Create spectrogram
         self.create_spectrogram()
@@ -400,10 +360,10 @@ class USVRecorderAnalyzer:
                 self.audio_file = file_path
                 
                 filename = os.path.basename(file_path)
-                self.file_label.config(text=f"Loaded: {filename}", fg="green")
-                self.analyze_button.config(state=tk.NORMAL)
-                
                 duration = len(self.audio_data) / self.sample_rate
+                self.file_label.config(text=f"Selected: {filename} — {duration:.2f}s, {self.sample_rate} Hz", fg="green")
+                self.analyze_button.config(state=tk.NORMAL)
+                self.save_recording_btn.config(state=tk.NORMAL)
                 self.status_label.config(text=f"File loaded: {duration:.2f}s, {self.sample_rate}Hz")
                 
                 self.create_spectrogram()
