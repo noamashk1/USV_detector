@@ -1,6 +1,5 @@
 import numpy as np
 import sounddevice as sd
-from scipy.signal import butter, lfilter
 import gpiozero  # Recommended library for Pi 5
 import time
 import tkinter as tk
@@ -12,8 +11,8 @@ import threading
 FS = 384000
 CHUNK_SIZE = 2048
 WINDOW_SIZE = 8192
-THRESHOLD_RMS = 0.02
-PEAK_RATIO = 10.0    # "Needle" ratio (peak must be 10x above average)
+# Same detection as USV_recorder_analyzer: FFT on raw window, RMS of |FFT|^2 in ultrasonic band
+THRESHOLD_RMS = 0.6   # default matches analyzer "Ultrasonic Threshold (RMS)"
 LOW_CUT = 50000
 HIGH_CUT = 90000
 GPIO_PIN = 18        # BCM pin for TTL (set from UI at start)
@@ -38,78 +37,51 @@ def find_dodotronic_device():
 # --- GPIO (Raspberry Pi), created on Start from UI pin ---
 ttl_out = None
 
-# --- Band-pass filter ---
-def butter_bandpass(lowcut, highcut, fs, order=5):
-    nyq = 0.5 * fs
-    b, a = butter(order, [lowcut/nyq, highcut/nyq], btype='band')
-    return b, a
-
-# Runtime params (set from GUI on Start)
-B, A = butter_bandpass(LOW_CUT, HIGH_CUT, FS)
+# Runtime state
 data_buffer = np.zeros(WINDOW_SIZE)
 is_detected = False
 detection_status = {'value': False}
 
-def verify_peak_with_fft(signal):
+
+def compute_band_rms_and_peak(window, low_hz, high_hz, fs):
     """
-    Run FFT and check for a prominent spectral "needle" in the USV band.
+    Same logic as USV_recorder_analyzer: FFT on window, then RMS of |FFT|^2 in [low_hz, high_hz].
+    Returns (rms, peak_freq_hz). peak_freq_hz is 0 if band is empty.
     """
-    # FFT (real FFT is more efficient)
-    fft_vals = np.abs(np.fft.rfft(signal))
-    freqs = np.fft.rfftfreq(len(signal), 1/FS)
-    
-    # Restrict to relevant frequency range (50-90 kHz)
-    mask = (freqs >= LOW_CUT) & (freqs <= HIGH_CUT)
-    if not np.any(mask): 
-        return False, 0
-    
-    relevant_mags = fft_vals[mask]
-    peak_val = np.max(relevant_mags)
-    
-    # Average magnitude across full spectrum (noise floor)
-    avg_noise = np.mean(fft_vals)
-    
-    # Check "needle" ratio - is the USV-band peak well above the noise?
-    if peak_val > (avg_noise * PEAK_RATIO):
-        peak_freq = freqs[mask][np.argmax(relevant_mags)]
-        return True, peak_freq
-    
-    return False, 0
+    fft = np.fft.rfft(window)
+    freqs = np.fft.rfftfreq(len(window), 1 / fs)
+    mask = (freqs >= low_hz) & (freqs <= high_hz)
+    ultrasonic_fft = fft[mask]
+    if len(ultrasonic_fft) == 0:
+        return 0.0, 0.0
+    rms = np.sqrt(np.mean(np.abs(ultrasonic_fft) ** 2))
+    peak_idx = np.argmax(np.abs(ultrasonic_fft))
+    peak_freq = freqs[mask][peak_idx]
+    return rms, peak_freq
+
 
 def process_audio(indata, frames, time_info, status):
     global data_buffer, is_detected
-    
-    # Update buffer (sliding window)
+
+    # Sliding window (raw audio, like analyzer)
     data_buffer = np.roll(data_buffer, -frames)
     data_buffer[-frames:] = indata[:, 0]
-    
-    # Filter the windowed data
-    filtered_data = lfilter(B, A, data_buffer)
-    
-    # Step 1: Quick RMS check (saves processing time)
-    rms = np.sqrt(np.mean(filtered_data**2))
-    
+
+    # Same criterion as USV_recorder_analyzer: FFT-band RMS > threshold
+    rms, peak_freq = compute_band_rms_and_peak(data_buffer, LOW_CUT, HIGH_CUT, FS)
+
     if rms > THRESHOLD_RMS:
-        # Step 2: Verify "needle" with FFT
-        success, freq = verify_peak_with_fft(filtered_data)
-        
-        if success:
-            if not is_detected:
-                if ttl_out is not None:
-                    ttl_out.on()
-                print(f"USV CONFIRMED! Freq: {freq/1000:.1f} kHz | RMS: {rms:.4f}")
-                is_detected = True
-        else:
-            if is_detected:
-                if ttl_out is not None:
-                    ttl_out.off()
-                is_detected = False
+        if not is_detected:
+            if ttl_out is not None:
+                ttl_out.on()
+            print(f"USV CONFIRMED! Freq: {peak_freq/1000:.1f} kHz | RMS: {rms:.4f}")
+            is_detected = True
     else:
         if is_detected:
             if ttl_out is not None:
                 ttl_out.off()
             is_detected = False
-    
+
     detection_status['value'] = is_detected
 
 # --- GUI and run ---
@@ -142,18 +114,17 @@ def run_listener():
 
 def apply_params_and_start():
     """Read GUI params, validate, set globals, build stream_kwargs."""
-    global B, A, data_buffer, THRESHOLD_RMS, LOW_CUT, HIGH_CUT, CHUNK_SIZE, WINDOW_SIZE, PEAK_RATIO, GPIO_PIN, ttl_out, _stream_kwargs
+    global data_buffer, THRESHOLD_RMS, LOW_CUT, HIGH_CUT, CHUNK_SIZE, WINDOW_SIZE, GPIO_PIN, ttl_out, _stream_kwargs
     try:
         low = int(low_cut_var.get())
         high = int(high_cut_var.get())
         rms = float(rms_var.get())
         chunk_ms = float(chunk_ms_var.get())
         window_ms = float(window_ms_var.get())
-        peak_ratio = float(peak_ratio_var.get())
         gpio_pin = int(gpio_pin_var.get())
     except ValueError:
         return False
-    if low <= 0 or high <= low or rms <= 0 or chunk_ms <= 0 or window_ms < chunk_ms or peak_ratio <= 0 or gpio_pin < 0:
+    if low <= 0 or high <= low or rms <= 0 or chunk_ms <= 0 or window_ms < chunk_ms or gpio_pin < 0:
         return False
     CHUNK_SIZE = int(FS * chunk_ms / 1000.0)
     WINDOW_SIZE = int(FS * window_ms / 1000.0)
@@ -162,7 +133,6 @@ def apply_params_and_start():
     LOW_CUT = low
     HIGH_CUT = high
     THRESHOLD_RMS = rms
-    PEAK_RATIO = peak_ratio
     GPIO_PIN = gpio_pin
     if ttl_out is not None:
         try:
@@ -173,7 +143,6 @@ def apply_params_and_start():
         ttl_out = gpiozero.OutputDevice(GPIO_PIN)
     except Exception:
         ttl_out = None
-    B, A = butter_bandpass(LOW_CUT, HIGH_CUT, FS)
     data_buffer = np.zeros(WINDOW_SIZE)
     _stream_kwargs = dict(samplerate=FS, channels=1, callback=process_audio, blocksize=CHUNK_SIZE)
     if device_index is not None:
@@ -190,7 +159,7 @@ def toggle_run():
         status_label.config(text="Stopped", bg="gray")
     else:
         if not apply_params_and_start():
-            messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window (ms) >= chunk (ms), peak ratio > 0, GPIO pin >= 0.")
+            messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window (ms) >= chunk (ms), GPIO pin >= 0.")
             return
         running = True
         btn.config(text="Stop")
@@ -207,7 +176,7 @@ def poll_status():
 
 root = tk.Tk()
 root.title("Online USV Detector")
-root.geometry("340x380")
+root.geometry("340x350")
 root.resizable(False, False)
 
 mic_text = dev_name if len(dev_name) <= 32 else dev_name[:29] + "..."
@@ -219,10 +188,9 @@ params_frame.pack(fill=tk.X, padx=8, pady=4)
 
 low_cut_var = tk.StringVar(value="50000")
 high_cut_var = tk.StringVar(value="90000")
-rms_var = tk.StringVar(value="0.02")
+rms_var = tk.StringVar(value="0.6")
 chunk_ms_var = tk.StringVar(value="5")
 window_ms_var = tk.StringVar(value="20")
-peak_ratio_var = tk.StringVar(value="10.0")
 gpio_pin_var = tk.StringVar(value="18")
 
 row = 0
@@ -232,7 +200,7 @@ row += 1
 tk.Label(params_frame, text="High cut (Hz):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=high_cut_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
-tk.Label(params_frame, text="RMS threshold:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Label(params_frame, text="Threshold (FFT RMS):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=rms_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
 tk.Label(params_frame, text="Chunk (ms):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
@@ -240,9 +208,6 @@ tk.Entry(params_frame, textvariable=chunk_ms_var, width=10).grid(row=row, column
 row += 1
 tk.Label(params_frame, text="Window (ms):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=window_ms_var, width=10).grid(row=row, column=1, pady=2)
-row += 1
-tk.Label(params_frame, text="Peak ratio:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
-tk.Entry(params_frame, textvariable=peak_ratio_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
 tk.Label(params_frame, text="GPIO pin (BCM):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=gpio_pin_var, width=10).grid(row=row, column=1, pady=2)
