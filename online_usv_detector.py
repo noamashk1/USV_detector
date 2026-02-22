@@ -116,8 +116,10 @@ def apply_params_and_start():
     """Read GUI params, validate, set globals, build stream_kwargs."""
     global data_buffer, THRESHOLD_RMS, LOW_CUT, HIGH_CUT, CHUNK_SIZE, WINDOW_SIZE, GPIO_PIN, ttl_out, _stream_kwargs
     try:
-        low = int(low_cut_var.get())
-        high = int(high_cut_var.get())
+        low_khz = float(low_cut_var.get())
+        high_khz = float(high_cut_var.get())
+        low = int(low_khz * 1000)
+        high = int(high_khz * 1000)
         rms = float(rms_var.get())
         chunk_ms = float(chunk_ms_var.get())
         window_ms = float(window_ms_var.get())
@@ -176,7 +178,7 @@ def poll_status():
 
 root = tk.Tk()
 root.title("Online USV Detector")
-root.geometry("340x350")
+root.geometry("380x350")
 root.resizable(False, False)
 
 mic_text = dev_name if len(dev_name) <= 32 else dev_name[:29] + "..."
@@ -186,21 +188,21 @@ tk.Label(root, text=f"Mic: {mic_text}", font=("Arial", 9)).pack(pady=(6, 2))
 params_frame = tk.LabelFrame(root, text="Parameters", padx=8, pady=6)
 params_frame.pack(fill=tk.X, padx=8, pady=4)
 
-low_cut_var = tk.StringVar(value="50000")
-high_cut_var = tk.StringVar(value="90000")
+low_cut_var = tk.StringVar(value="50")
+high_cut_var = tk.StringVar(value="90")
 rms_var = tk.StringVar(value="0.6")
-chunk_ms_var = tk.StringVar(value="5")
-window_ms_var = tk.StringVar(value="20")
+chunk_ms_var = tk.StringVar(value="50")
+window_ms_var = tk.StringVar(value="100")
 gpio_pin_var = tk.StringVar(value="18")
 
 row = 0
-tk.Label(params_frame, text="Low cut (Hz):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Label(params_frame, text="Low cut (kHz):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=low_cut_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
-tk.Label(params_frame, text="High cut (Hz):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Label(params_frame, text="High cut (kHz):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=high_cut_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
-tk.Label(params_frame, text="Threshold (FFT RMS):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Label(params_frame, text="Threshold (FFT RMS):", width=22, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=rms_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
 tk.Label(params_frame, text="Chunk (ms):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
