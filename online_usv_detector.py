@@ -4,6 +4,7 @@ from scipy.signal import butter, lfilter
 import gpiozero  # Recommended library for Pi 5
 import time
 import tkinter as tk
+from tkinter import messagebox
 import threading
 
 # --- System settings ---
@@ -15,7 +16,7 @@ THRESHOLD_RMS = 0.02
 PEAK_RATIO = 10.0    # "Needle" ratio (peak must be 10x above average)
 LOW_CUT = 50000
 HIGH_CUT = 90000
-GPIO_PIN = 18        # BCM pin number
+GPIO_PIN = 18        # BCM pin for TTL (set from UI at start)
 
 def find_dodotronic_device():
     """Search for dodotronic microphone and return device index, or None"""
@@ -34,9 +35,8 @@ def find_dodotronic_device():
                     pass
     return None
 
-# --- GPIO setup for Raspberry Pi 5 ---
-# gpiozero works well on Pi 5 and manages the new kernel daemons
-ttl_out = gpiozero.OutputDevice(GPIO_PIN)
+# --- GPIO (Raspberry Pi), created on Start from UI pin ---
+ttl_out = None
 
 # --- Band-pass filter ---
 def butter_bandpass(lowcut, highcut, fs, order=5):
@@ -44,12 +44,11 @@ def butter_bandpass(lowcut, highcut, fs, order=5):
     b, a = butter(order, [lowcut/nyq, highcut/nyq], btype='band')
     return b, a
 
+# Runtime params (set from GUI on Start)
 B, A = butter_bandpass(LOW_CUT, HIGH_CUT, FS)
-
-# Global buffer and detection state (shared with GUI)
 data_buffer = np.zeros(WINDOW_SIZE)
 is_detected = False
-detection_status = {'value': False}  # for GUI polling
+detection_status = {'value': False}
 
 def verify_peak_with_fft(signal):
     """
@@ -96,18 +95,19 @@ def process_audio(indata, frames, time_info, status):
         
         if success:
             if not is_detected:
-                ttl_out.on()  # TTL on
+                if ttl_out is not None:
+                    ttl_out.on()
                 print(f"USV CONFIRMED! Freq: {freq/1000:.1f} kHz | RMS: {rms:.4f}")
                 is_detected = True
         else:
-            # Strong noise but not a "needle" (e.g. door slam)
             if is_detected:
-                ttl_out.off()
+                if ttl_out is not None:
+                    ttl_out.off()
                 is_detected = False
     else:
-        # Back to quiet
         if is_detected:
-            ttl_out.off()
+            if ttl_out is not None:
+                ttl_out.off()
             is_detected = False
     
     detection_status['value'] = is_detected
@@ -119,31 +119,67 @@ if device_index is not None:
 else:
     dev_name = "Default device"
 
-stream_kwargs = dict(samplerate=FS, channels=1, callback=process_audio, blocksize=CHUNK_SIZE)
-if device_index is not None:
-    stream_kwargs['device'] = device_index
-
 running = False
-stream = None
 listener_thread = None
+_stream_kwargs = None
 
 def run_listener():
-    global stream, running
+    global running
+    if _stream_kwargs is None:
+        return
     try:
-        with sd.InputStream(**stream_kwargs) as stream:
+        with sd.InputStream(**_stream_kwargs) as stream:
             while running:
                 time.sleep(0.1)
     except Exception as e:
         print("Listener error:", e)
     finally:
-        if running is False:
+        if running is False and ttl_out is not None:
             try:
                 ttl_out.off()
             except Exception:
                 pass
 
+def apply_params_and_start():
+    """Read GUI params, validate, set globals, build stream_kwargs."""
+    global B, A, data_buffer, THRESHOLD_RMS, LOW_CUT, HIGH_CUT, CHUNK_SIZE, WINDOW_SIZE, PEAK_RATIO, GPIO_PIN, ttl_out, _stream_kwargs
+    try:
+        low = int(low_cut_var.get())
+        high = int(high_cut_var.get())
+        rms = float(rms_var.get())
+        chunk = int(chunk_var.get())
+        win = int(window_var.get())
+        peak_ratio = float(peak_ratio_var.get())
+        gpio_pin = int(gpio_pin_var.get())
+    except ValueError:
+        return False
+    if low <= 0 or high <= low or rms <= 0 or chunk <= 0 or win < chunk or peak_ratio <= 0 or gpio_pin < 0:
+        return False
+    LOW_CUT = low
+    HIGH_CUT = high
+    THRESHOLD_RMS = rms
+    CHUNK_SIZE = chunk
+    WINDOW_SIZE = win
+    PEAK_RATIO = peak_ratio
+    GPIO_PIN = gpio_pin
+    if ttl_out is not None:
+        try:
+            ttl_out.close()
+        except Exception:
+            pass
+    try:
+        ttl_out = gpiozero.OutputDevice(GPIO_PIN)
+    except Exception:
+        ttl_out = None
+    B, A = butter_bandpass(LOW_CUT, HIGH_CUT, FS)
+    data_buffer = np.zeros(WINDOW_SIZE)
+    _stream_kwargs = dict(samplerate=FS, channels=1, callback=process_audio, blocksize=CHUNK_SIZE)
+    if device_index is not None:
+        _stream_kwargs['device'] = device_index
+    return True
+
 def toggle_run():
-    global running, stream, listener_thread
+    global running, listener_thread
     if running:
         running = False
         if listener_thread is not None:
@@ -151,6 +187,9 @@ def toggle_run():
         btn.config(text="Start")
         status_label.config(text="Stopped", bg="gray")
     else:
+        if not apply_params_and_start():
+            messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window >= chunk, peak ratio > 0, GPIO pin >= 0.")
+            return
         running = True
         btn.config(text="Stop")
         listener_thread = threading.Thread(target=run_listener, daemon=True)
@@ -166,13 +205,48 @@ def poll_status():
 
 root = tk.Tk()
 root.title("Online USV Detector")
-root.geometry("320x140")
+root.geometry("340x380")
 root.resizable(False, False)
 
 mic_text = dev_name if len(dev_name) <= 32 else dev_name[:29] + "..."
-tk.Label(root, text=f"Mic: {mic_text}", font=("Arial", 9)).pack(pady=(8, 2))
+tk.Label(root, text=f"Mic: {mic_text}", font=("Arial", 9)).pack(pady=(6, 2))
+
+# Parameters frame
+params_frame = tk.LabelFrame(root, text="Parameters", padx=8, pady=6)
+params_frame.pack(fill=tk.X, padx=8, pady=4)
+
+low_cut_var = tk.StringVar(value="50000")
+high_cut_var = tk.StringVar(value="90000")
+rms_var = tk.StringVar(value="0.02")
+chunk_var = tk.StringVar(value="2048")
+window_var = tk.StringVar(value="8192")
+peak_ratio_var = tk.StringVar(value="10.0")
+gpio_pin_var = tk.StringVar(value="18")
+
+row = 0
+tk.Label(params_frame, text="Low cut (Hz):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=low_cut_var, width=10).grid(row=row, column=1, pady=2)
+row += 1
+tk.Label(params_frame, text="High cut (Hz):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=high_cut_var, width=10).grid(row=row, column=1, pady=2)
+row += 1
+tk.Label(params_frame, text="RMS threshold:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=rms_var, width=10).grid(row=row, column=1, pady=2)
+row += 1
+tk.Label(params_frame, text="Chunk size:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=chunk_var, width=10).grid(row=row, column=1, pady=2)
+row += 1
+tk.Label(params_frame, text="Window size:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=window_var, width=10).grid(row=row, column=1, pady=2)
+row += 1
+tk.Label(params_frame, text="Peak ratio:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=peak_ratio_var, width=10).grid(row=row, column=1, pady=2)
+row += 1
+tk.Label(params_frame, text="GPIO pin (BCM):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=gpio_pin_var, width=10).grid(row=row, column=1, pady=2)
+
 btn = tk.Button(root, text="Start", command=toggle_run, width=12, height=2, font=("Arial", 12))
-btn.pack(pady=10)
+btn.pack(pady=8)
 
 tk.Label(root, text="Status:", font=("Arial", 10)).pack(anchor=tk.W, padx=10)
 status_frame = tk.Frame(root)
@@ -186,11 +260,12 @@ poll_status()
 def on_closing():
     global running
     running = False
-    try:
-        ttl_out.off()
-        ttl_out.close()
-    except Exception:
-        pass
+    if ttl_out is not None:
+        try:
+            ttl_out.off()
+            ttl_out.close()
+        except Exception:
+            pass
     root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
