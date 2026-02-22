@@ -128,8 +128,8 @@ class USVRecorderAnalyzer:
             self.recorder.check_sample_rate_support()
         
         # GUI variables
-        self.threshold_var = tk.DoubleVar(value=0.2)
-        self.min_freq_khz_var = tk.DoubleVar(value=30.0)
+        self.threshold_var = tk.DoubleVar(value=0.6)
+        self.min_freq_khz_var = tk.DoubleVar(value=50.0)
         self.max_freq_khz_var = tk.DoubleVar(value=90.0)
         self.window_size_ms_var = tk.DoubleVar(value=100.0)
         self.hop_overlap_var = tk.DoubleVar(value=50.0)
