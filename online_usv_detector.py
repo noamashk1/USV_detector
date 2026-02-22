@@ -147,19 +147,21 @@ def apply_params_and_start():
         low = int(low_cut_var.get())
         high = int(high_cut_var.get())
         rms = float(rms_var.get())
-        chunk = int(chunk_var.get())
-        win = int(window_var.get())
+        chunk_ms = float(chunk_ms_var.get())
+        window_ms = float(window_ms_var.get())
         peak_ratio = float(peak_ratio_var.get())
         gpio_pin = int(gpio_pin_var.get())
     except ValueError:
         return False
-    if low <= 0 or high <= low or rms <= 0 or chunk <= 0 or win < chunk or peak_ratio <= 0 or gpio_pin < 0:
+    if low <= 0 or high <= low or rms <= 0 or chunk_ms <= 0 or window_ms < chunk_ms or peak_ratio <= 0 or gpio_pin < 0:
+        return False
+    CHUNK_SIZE = int(FS * chunk_ms / 1000.0)
+    WINDOW_SIZE = int(FS * window_ms / 1000.0)
+    if CHUNK_SIZE <= 0 or WINDOW_SIZE < CHUNK_SIZE:
         return False
     LOW_CUT = low
     HIGH_CUT = high
     THRESHOLD_RMS = rms
-    CHUNK_SIZE = chunk
-    WINDOW_SIZE = win
     PEAK_RATIO = peak_ratio
     GPIO_PIN = gpio_pin
     if ttl_out is not None:
@@ -188,7 +190,7 @@ def toggle_run():
         status_label.config(text="Stopped", bg="gray")
     else:
         if not apply_params_and_start():
-            messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window >= chunk, peak ratio > 0, GPIO pin >= 0.")
+            messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window (ms) >= chunk (ms), peak ratio > 0, GPIO pin >= 0.")
             return
         running = True
         btn.config(text="Stop")
@@ -218,8 +220,8 @@ params_frame.pack(fill=tk.X, padx=8, pady=4)
 low_cut_var = tk.StringVar(value="50000")
 high_cut_var = tk.StringVar(value="90000")
 rms_var = tk.StringVar(value="0.02")
-chunk_var = tk.StringVar(value="2048")
-window_var = tk.StringVar(value="8192")
+chunk_ms_var = tk.StringVar(value="5")
+window_ms_var = tk.StringVar(value="20")
 peak_ratio_var = tk.StringVar(value="10.0")
 gpio_pin_var = tk.StringVar(value="18")
 
@@ -233,11 +235,11 @@ row += 1
 tk.Label(params_frame, text="RMS threshold:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=rms_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
-tk.Label(params_frame, text="Chunk size:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
-tk.Entry(params_frame, textvariable=chunk_var, width=10).grid(row=row, column=1, pady=2)
+tk.Label(params_frame, text="Chunk (ms):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=chunk_ms_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
-tk.Label(params_frame, text="Window size:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
-tk.Entry(params_frame, textvariable=window_var, width=10).grid(row=row, column=1, pady=2)
+tk.Label(params_frame, text="Window (ms):", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
+tk.Entry(params_frame, textvariable=window_ms_var, width=10).grid(row=row, column=1, pady=2)
 row += 1
 tk.Label(params_frame, text="Peak ratio:", width=14, anchor=tk.W).grid(row=row, column=0, sticky=tk.W, pady=2)
 tk.Entry(params_frame, textvariable=peak_ratio_var, width=10).grid(row=row, column=1, pady=2)
