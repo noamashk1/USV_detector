@@ -220,10 +220,6 @@ class USVRecorderAnalyzer:
                                         command=self.analyze_audio, width=15, state=tk.DISABLED)
         self.analyze_button.pack(side=tk.LEFT, padx=5)
         
-        self.play_button = tk.Button(button_frame, text="Play Detections",
-                                     command=self.play_detection, width=15, state=tk.DISABLED)
-        self.play_button.pack(side=tk.LEFT, padx=5)
-        
         self.save_results_button = tk.Button(button_frame, text="Save Results",
                                              command=self.save_results, width=15, state=tk.DISABLED)
         self.save_results_button.pack(side=tk.LEFT, padx=5)
@@ -483,7 +479,6 @@ class USVRecorderAnalyzer:
             self.results_text.insert(tk.END, f"  Peak frequency: {detection['max_freq']:.1f} Hz\n\n")
         
         self.status_label.config(text=f"Status: Analysis complete - {len(self.detection_results)} USV detections")
-        self.play_button.config(state=tk.NORMAL)
         self.save_results_button.config(state=tk.NORMAL)
         
         self.create_visualization()
@@ -589,27 +584,6 @@ class USVRecorderAnalyzer:
                 self.ax_spec.clear()
             self.ax_spec.set_title(f"Error creating spectrogram: {str(e)}")
             self.canvas_spec.draw()
-    
-    def play_detection(self):
-        """Play detected USV segments"""
-        if not self.detection_results:
-            messagebox.showwarning("No Detections", "No USV detections to play")
-            return
-        
-        combined_audio = []
-        for detection in self.detection_results:
-            start_idx = int(detection['start_time'] * self.sample_rate)
-            end_idx = int(detection['end_time'] * self.sample_rate)
-            segment = self.audio_data[start_idx:end_idx]
-            combined_audio.extend(segment)
-        
-        if combined_audio:
-            combined_audio = np.array(combined_audio)
-            try:
-                sd.play(combined_audio, self.sample_rate)
-                self.status_label.config(text="Status: Playing USV detections...")
-            except Exception as e:
-                messagebox.showerror("Playback Error", f"Failed to play audio:\n{str(e)}")
     
     def save_results(self):
         """Save analysis results"""
