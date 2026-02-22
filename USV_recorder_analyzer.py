@@ -130,6 +130,7 @@ class USVRecorderAnalyzer:
         # GUI variables
         self.threshold_var = tk.DoubleVar(value=0.2)
         self.min_freq_khz_var = tk.DoubleVar(value=30.0)
+        self.max_freq_khz_var = tk.DoubleVar(value=90.0)
         self.window_size_ms_var = tk.DoubleVar(value=100.0)
         self.hop_overlap_var = tk.DoubleVar(value=50.0)
         self.recording_duration_var = tk.DoubleVar(value=10.0)
@@ -205,6 +206,9 @@ class USVRecorderAnalyzer:
         
         tk.Label(params_frame, text="Min Frequency (kHz):").pack(pady=5)
         tk.Entry(params_frame, textvariable=self.min_freq_khz_var).pack(pady=2)
+        
+        tk.Label(params_frame, text="Max Frequency (kHz):").pack(pady=5)
+        tk.Entry(params_frame, textvariable=self.max_freq_khz_var).pack(pady=2)
         
         tk.Label(params_frame, text="Window Size (ms):").pack(pady=5)
         tk.Entry(params_frame, textvariable=self.window_size_ms_var).pack(pady=2)
@@ -410,6 +414,7 @@ class USVRecorderAnalyzer:
         try:
             fs = self.sample_rate
             ultrasonic_min_freq = float(self.min_freq_khz_var.get()) * 1000.0
+            ultrasonic_max_freq = float(self.max_freq_khz_var.get()) * 1000.0
             threshold = float(self.threshold_var.get())
             
             window_size_ms = float(self.window_size_ms_var.get())
@@ -429,7 +434,7 @@ class USVRecorderAnalyzer:
                 fft = np.fft.rfft(window)
                 freqs = np.fft.rfftfreq(len(window), 1/fs)
                 
-                mask = freqs >= ultrasonic_min_freq
+                mask = (freqs >= ultrasonic_min_freq) & (freqs <= ultrasonic_max_freq)
                 ultrasonic_fft = fft[mask]
                 
                 if len(ultrasonic_fft) > 0:
@@ -608,6 +613,7 @@ class USVRecorderAnalyzer:
                     f.write(f"Sample Rate: {self.sample_rate} Hz\n")
                     f.write(f"Threshold: {self.threshold_var.get()}\n")
                     f.write(f"Min Frequency: {self.min_freq_khz_var.get()} kHz\n")
+                    f.write(f"Max Frequency: {self.max_freq_khz_var.get()} kHz\n")
                     f.write(f"Window Size: {self.window_size_ms_var.get()} ms\n")
                     f.write(f"Hop Overlap: {self.hop_overlap_var.get()}%\n")
                     f.write(f"Total detections: {len(self.detection_results)}\n\n")
