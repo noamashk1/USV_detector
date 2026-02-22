@@ -190,12 +190,6 @@ class USVRecorderAnalyzer:
         self.file_label = tk.Label(top_frame, text="No file selected", fg="red")
         self.file_label.pack(pady=5)
         
-        # Progress bar
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = tk.Scale(top_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-                                    variable=self.progress_var, length=400, state=tk.DISABLED)
-        self.progress_bar.pack(pady=5)
-        
         # --- Analysis parameters (like USV.py) ---
         params_frame = tk.Frame(self.master)
         params_frame.pack(pady=10)
@@ -305,8 +299,6 @@ class USVRecorderAnalyzer:
         self.is_recording = True
         self.record_button.config(text="Recording...", state=tk.DISABLED)
         self.status_label.config(text=f"Recording for {duration} seconds...")
-        self.progress_bar.config(state=tk.NORMAL)
-        self.progress_var.set(0)
         
         # Start recording in separate thread
         self.recording_thread = threading.Thread(target=self.record_audio, args=(duration,), daemon=True)
@@ -331,8 +323,6 @@ class USVRecorderAnalyzer:
         self.audio_file = None  # Not from file
         
         self.record_button.config(text="Record", state=tk.NORMAL)
-        self.progress_bar.config(state=tk.DISABLED)
-        self.progress_var.set(100)
         
         duration = len(audio_data) / self.sample_rate
         self.status_label.config(text=f"Recording completed: {duration:.2f}s, {self.sample_rate}Hz")
@@ -353,7 +343,6 @@ class USVRecorderAnalyzer:
         """Called when recording error occurs"""
         self.is_recording = False
         self.record_button.config(text="Record", state=tk.NORMAL)
-        self.progress_bar.config(state=tk.DISABLED)
         self.status_label.config(text="Status: Recording failed")
     
     def load_file(self):
@@ -412,8 +401,6 @@ class USVRecorderAnalyzer:
             return
         
         self.status_label.config(text="Status: Analyzing...")
-        self.progress_bar.config(state=tk.NORMAL)
-        self.progress_var.set(0)
         
         self.analysis_thread = threading.Thread(target=self.analyze_audio_data, daemon=True)
         self.analysis_thread.start()
@@ -436,9 +423,6 @@ class USVRecorderAnalyzer:
             total_windows = len(self.audio_data) // hop_size
             
             for i in range(0, len(self.audio_data) - window_size, hop_size):
-                progress = (i / hop_size) / total_windows * 100
-                self.master.after(0, lambda p=progress: self.progress_var.set(p))
-                
                 window = self.audio_data[i:i + window_size]
                 fft = np.fft.rfft(window)
                 freqs = np.fft.rfftfreq(len(window), 1/fs)
@@ -470,9 +454,6 @@ class USVRecorderAnalyzer:
     
     def display_results(self):
         """Display analysis results"""
-        self.progress_bar.config(state=tk.DISABLED)
-        self.progress_var.set(100)
-        
         if not self.detection_results:
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(tk.END, "No USV detections found.")
