@@ -141,6 +141,7 @@ class USVRecorderAnalyzer:
         self.sample_rate = None
         self.detection_results = None
         self.is_recording = False
+        self.show_spec_bands_var = tk.BooleanVar(value=True)
         
         # Setup GUI
         self.setup_gui()
@@ -262,6 +263,14 @@ class USVRecorderAnalyzer:
         # Spectrogram tab
         spec_frame = tk.Frame(self.results_notebook)
         self.results_notebook.add(spec_frame, text="Spectrogram")
+        
+        spec_controls = tk.Frame(spec_frame)
+        spec_controls.pack(fill=tk.X, pady=(0, 5))
+        self.spec_show_bands_cb = tk.Checkbutton(
+            spec_controls, text="Show detection bands",
+            variable=self.show_spec_bands_var, command=self.create_spectrogram
+        )
+        self.spec_show_bands_cb.pack(anchor=tk.W)
         
         self.fig_spec, self.ax_spec = plt.subplots(figsize=(10, 6))
         self.canvas_spec = FigureCanvasTkAgg(self.fig_spec, spec_frame)
@@ -561,18 +570,11 @@ class USVRecorderAnalyzer:
             
             self.colorbar_spec = self.fig_spec.colorbar(im, ax=self.ax_spec, label='Magnitude (dB)')
             
-            if self.detection_results:
-                for i, detection in enumerate(self.detection_results):
+            if self.detection_results and self.show_spec_bands_var.get():
+                for detection in self.detection_results:
                     start_time = detection['start_time']
                     end_time = detection['end_time']
-                    # Only show circles, no vertical lines
-                    mid_time = (start_time + end_time) / 2
-                    max_freq = min(freqs[-1], detection.get('max_freq', freqs[-1]/2))
-                    self.ax_spec.text(mid_time, max_freq, f'{i+1}', 
-                                    ha='center', va='center', fontsize=10, 
-                                    fontweight='bold', color='yellow',
-                                    bbox=dict(boxstyle='circle', facecolor='red', 
-                                            alpha=0.7, edgecolor='yellow'))
+                    self.ax_spec.axvspan(start_time, end_time, alpha=0.3, color='red')
             
             self.ax_spec.set_xlabel('Time (seconds)')
             self.ax_spec.set_ylabel('Frequency (Hz)')
