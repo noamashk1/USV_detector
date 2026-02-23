@@ -1,7 +1,34 @@
 import numpy as np
 import sounddevice as sd
-import gpiozero  # Recommended library for Pi 5
 import time
+try:
+    import lgpio
+except ModuleNotFoundError:
+    lgpio = None
+
+
+class LgpioTTL:
+    """TTL output via lgpio (same interface as gpiozero.OutputDevice)."""
+
+    def __init__(self, gpio_pin):
+        self._h = lgpio.gpiochip_open(0)
+        err = lgpio.gpio_claim_output(self._h, gpio_pin)
+        if err < 0:
+            raise RuntimeError(f"lgpio gpio_claim_output failed: {err}")
+        self._pin = gpio_pin
+
+    def on(self):
+        lgpio.gpio_write(self._h, self._pin, 1)
+
+    def off(self):
+        lgpio.gpio_write(self._h, self._pin, 0)
+
+    def close(self):
+        try:
+            lgpio.gpio_free(self._h, self._pin)
+        except Exception:
+            pass
+        lgpio.gpiochip_close(self._h)
 import tkinter as tk
 from tkinter import messagebox
 import threading
@@ -142,7 +169,7 @@ def apply_params_and_start():
         except Exception:
             pass
     try:
-        ttl_out = gpiozero.OutputDevice(GPIO_PIN)
+        ttl_out = LgpioTTL(GPIO_PIN) if lgpio else None
     except Exception:
         ttl_out = None
     data_buffer = np.zeros(WINDOW_SIZE)
