@@ -18,7 +18,7 @@ class UltrasonicDetectorApp:
         self.min_freq_khz_var = tk.DoubleVar(value=30.0)
         self.running = False
 
-        # GUI layout
+        # GUI layoutd
         tk.Label(master, text="Ultrasonic Threshold (RMS):").pack(pady=5)
         tk.Entry(master, textvariable=self.threshold_var).pack(pady=2)
 
