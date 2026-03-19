@@ -11,6 +11,8 @@ try:
 except ModuleNotFoundError:
     lgpio = None
 
+import os
+
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import threading
@@ -347,6 +349,7 @@ def stop_recording_and_stream():
         writer_thread.join(timeout=5.0)
 
     if recording_path:
+        print(f"Session folder: {os.path.dirname(recording_path)}")
         print(f"Recording saved to: {recording_path}")
         if dropped_chunks > 0:
             print(f"Dropped WAV chunks: {dropped_chunks}")
@@ -416,10 +419,10 @@ def toggle_run():
         messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window (ms) >= chunk (ms), GPIO pin >= 0.")
         return
 
-    # Choose output WAV path before starting the stream.
+    # Choose session name: a folder with this name is created; WAV + log go inside it.
     default_name = f"usv_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
     file_path = filedialog.asksaveasfilename(
-        title="Save WAV file",
+        title="Save session (folder name = file name without .wav)",
         defaultextension=".wav",
         initialfile=default_name,
         filetypes=[("WAV files", "*.wav"), ("All files", "*.*")]
@@ -433,7 +436,25 @@ def toggle_run():
     if not file_path.lower().endswith(".wav"):
         file_path += ".wav"
 
-    recording_path = file_path
+    parent_dir = os.path.dirname(os.path.abspath(file_path))
+    session_basename = os.path.splitext(os.path.basename(file_path))[0]
+    if not session_basename.strip():
+        messagebox.showerror("Invalid name", "Please choose a non-empty file name.")
+        btn.config(text="Start")
+        status_label.config(text="Stopped", bg="gray")
+        return
+
+    session_dir = os.path.join(parent_dir, session_basename)
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+    except OSError as e:
+        messagebox.showerror("Folder error", f"Could not create session folder:\n{e}")
+        btn.config(text="Start")
+        status_label.config(text="Stopped", bg="gray")
+        return
+
+    recording_path = os.path.join(session_dir, f"{session_basename}.wav")
+    log_path = os.path.join(session_dir, f"{session_basename}.log.csv")
     dropped_chunks = 0
 
     # Reset timing and event state for this run.
@@ -444,12 +465,6 @@ def toggle_run():
     log_dropped_rows = 0
 
     recording_queue = queue.Queue(maxsize=1000)  # stores PCM16 bytes chunks
-
-    # Create CSV log file next to the WAV file.
-    if recording_path.lower().endswith(".wav"):
-        log_path = recording_path[:-4] + ".log.csv"
-    else:
-        log_path = recording_path + ".log.csv"
     log_queue = queue.Queue(maxsize=1000)
     log_writer_thread = threading.Thread(
         target=log_writer_worker,
