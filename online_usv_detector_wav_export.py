@@ -3,6 +3,7 @@ import sounddevice as sd
 import time
 import wave
 import queue
+import csv
 from datetime import datetime
 
 try:
@@ -77,6 +78,20 @@ data_buffer = np.zeros(WINDOW_SIZE)
 is_detected = False
 detection_status = {'value': False}
 
+# Precise timing counters (for CSV log and later spectrogram markers)
+samples_processed = 0
+last_chunk_end_time_s = 0.0
+last_rms_value = 0.0
+
+# CSV log writer runtime state
+log_queue = None
+log_writer_thread = None
+log_path = None
+log_dropped_rows = 0
+
+event_lock = threading.Lock()
+current_event = None  # dict with fields until it ends
+
 # WAV writer runtime state (queue decouples callback from disk IO)
 recording_queue = None
 writer_thread = None
@@ -124,8 +139,41 @@ def wav_writer_worker(wav_path, audio_queue, fs):
             print(f"WAV writer: dropped chunks while writing: {dropped_chunks}")
 
 
+def log_writer_worker(csv_path, q):
+    """Write detection intervals (CSV) until sentinel None is received."""
+    try:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "start_time_s",
+                "end_time_s",
+                "duration_s",
+                "sampling_rate_hz",
+                "low_cut_hz",
+                "high_cut_hz",
+                "threshold_rms",
+                "rms_start",
+                "rms_end",
+                "peak_freq_hz",
+            ])
+            while True:
+                row = q.get()
+                if row is None:
+                    break
+                writer.writerow(row)
+                f.flush()
+    except Exception as e:
+        print(f"log_writer_worker error: {e}")
+
+
 def process_audio(indata, frames, time_info, status):
     global data_buffer, is_detected, dropped_chunks, recording_queue
+    global samples_processed, last_chunk_end_time_s, last_rms_value
+    global log_queue, log_dropped_rows, current_event
+
+    # Timing for this callback chunk.
+    # We timestamp detection transitions at the end of the chunk we just appended into the sliding window.
+    chunk_end_time_s = (samples_processed + frames) / FS
 
     # Sliding window (raw audio, like analyzer)
     data_buffer = np.roll(data_buffer, -frames)
@@ -133,17 +181,57 @@ def process_audio(indata, frames, time_info, status):
 
     # Same criterion as USV_recorder_analyzer: FFT-band RMS > threshold
     rms, peak_freq = compute_band_rms_and_peak(data_buffer, LOW_CUT, HIGH_CUT, FS)
+    last_rms_value = rms
 
     if rms > THRESHOLD_RMS:
         if not is_detected:
             if ttl_out is not None:
                 ttl_out.on()
             print(f"USV CONFIRMED! Freq: {peak_freq/1000:.1f} kHz | RMS: {rms:.4f}")
+
+            # Start an interval event for CSV logging.
+            with event_lock:
+                current_event = {
+                    "start_time_s": max(0.0, chunk_end_time_s - (WINDOW_SIZE / FS)),
+                    "low_cut_hz": int(LOW_CUT),
+                    "high_cut_hz": int(HIGH_CUT),
+                    "threshold_rms": float(THRESHOLD_RMS),
+                    "rms_start": float(rms),
+                    "rms_end": None,
+                    "peak_freq_hz": float(peak_freq),
+                }
             is_detected = True
     else:
         if is_detected:
             if ttl_out is not None:
                 ttl_out.off()
+
+            # Close and enqueue the interval event.
+            with event_lock:
+                if current_event is not None:
+                    current_event["end_time_s"] = chunk_end_time_s
+                    current_event["rms_end"] = float(rms)
+                    duration_s = current_event["end_time_s"] - current_event["start_time_s"]
+
+                    row = [
+                        current_event["start_time_s"],
+                        current_event["end_time_s"],
+                        duration_s,
+                        FS,
+                        current_event["low_cut_hz"],
+                        current_event["high_cut_hz"],
+                        current_event["threshold_rms"],
+                        current_event["rms_start"],
+                        current_event["rms_end"],
+                        current_event["peak_freq_hz"],
+                    ]
+                    try:
+                        if log_queue is not None:
+                            log_queue.put_nowait(row)
+                    except queue.Full:
+                        log_dropped_rows += 1
+                    current_event = None
+
             is_detected = False
 
     detection_status['value'] = is_detected
@@ -156,6 +244,10 @@ def process_audio(indata, frames, time_info, status):
             recording_queue.put_nowait(pcm16.tobytes())
         except queue.Full:
             dropped_chunks += 1
+
+    # Update timing counters after all processing for this chunk.
+    samples_processed += frames
+    last_chunk_end_time_s = chunk_end_time_s
 
 
 # --- GUI and run ---
@@ -238,6 +330,8 @@ def apply_params_and_start():
 def stop_recording_and_stream():
     """Stop the audio stream and finalize WAV file (if enabled)."""
     global running, listener_thread, recording_queue, writer_thread, recording_path, dropped_chunks
+    global log_queue, log_writer_thread, log_path, log_dropped_rows
+    global current_event, last_chunk_end_time_s, last_rms_value
     running = False
     if listener_thread is not None:
         listener_thread.join(timeout=2.0)
@@ -257,14 +351,61 @@ def stop_recording_and_stream():
         if dropped_chunks > 0:
             print(f"Dropped WAV chunks: {dropped_chunks}")
 
+    # If we stopped while still detected, close and log the last interval.
+    with event_lock:
+        if current_event is not None:
+            current_event["end_time_s"] = float(last_chunk_end_time_s)
+            current_event["rms_end"] = float(last_rms_value)
+            duration_s = current_event["end_time_s"] - current_event["start_time_s"]
+
+            row = [
+                current_event["start_time_s"],
+                current_event["end_time_s"],
+                duration_s,
+                FS,
+                current_event["low_cut_hz"],
+                current_event["high_cut_hz"],
+                current_event["threshold_rms"],
+                current_event["rms_start"],
+                current_event["rms_end"],
+                current_event["peak_freq_hz"],
+            ]
+            try:
+                if log_queue is not None:
+                    log_queue.put_nowait(row)
+            except queue.Full:
+                log_dropped_rows += 1
+            current_event = None
+
+    if log_queue is not None:
+        try:
+            log_queue.put(None, timeout=2.0)
+        except Exception:
+            pass
+
+    if log_writer_thread is not None:
+        log_writer_thread.join(timeout=5.0)
+
+    if log_path:
+        print(f"Detection log saved to: {log_path}")
+        if log_dropped_rows > 0:
+            print(f"Dropped CSV rows: {log_dropped_rows}")
+
     recording_queue = None
     writer_thread = None
     recording_path = None
     dropped_chunks = 0
 
+    log_queue = None
+    log_writer_thread = None
+    log_path = None
+    log_dropped_rows = 0
+
 
 def toggle_run():
     global running, listener_thread, recording_queue, writer_thread, recording_path, dropped_chunks
+    global log_queue, log_writer_thread, log_path, log_dropped_rows
+    global samples_processed, last_chunk_end_time_s, last_rms_value, current_event
     if running:
         stop_recording_and_stream()
         btn.config(text="Start")
@@ -294,7 +435,29 @@ def toggle_run():
 
     recording_path = file_path
     dropped_chunks = 0
+
+    # Reset timing and event state for this run.
+    samples_processed = 0
+    last_chunk_end_time_s = 0.0
+    last_rms_value = 0.0
+    current_event = None
+    log_dropped_rows = 0
+
     recording_queue = queue.Queue(maxsize=1000)  # stores PCM16 bytes chunks
+
+    # Create CSV log file next to the WAV file.
+    if recording_path.lower().endswith(".wav"):
+        log_path = recording_path[:-4] + ".log.csv"
+    else:
+        log_path = recording_path + ".log.csv"
+    log_queue = queue.Queue(maxsize=1000)
+    log_writer_thread = threading.Thread(
+        target=log_writer_worker,
+        args=(log_path, log_queue),
+        daemon=True,
+    )
+    log_writer_thread.start()
+
     writer_thread = threading.Thread(
         target=wav_writer_worker,
         args=(recording_path, recording_queue, FS),
