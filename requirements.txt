@@ -1,0 +1,8 @@
+numpy
+sounddevice
+scipy
+librosa
+matplotlib
+
+# Optional (used only on Raspberry Pi for GPIO TTL output)
+lgpio; platform_system != "Windows"
