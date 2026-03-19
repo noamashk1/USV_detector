@@ -12,10 +12,26 @@ except ModuleNotFoundError:
     lgpio = None
 
 import os
+import glob
 
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import threading
+
+try:
+    import librosa
+except ImportError:
+    librosa = None
+
+try:
+    import matplotlib
+
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+except ImportError:
+    plt = None
+    FigureCanvasTkAgg = None
 
 # --- System settings ---
 # 384 kHz - sample rate of dodotronic ultramic384K_evo microphone
@@ -496,9 +512,180 @@ def poll_status():
     root.after(150, poll_status)
 
 
+def find_session_wav_and_log(session_dir):
+    """
+    In a session folder, find the WAV and matching *.log.csv.
+    Prefer <folder_name>.wav if present (same layout as export).
+    """
+    session_dir = os.path.abspath(session_dir)
+    if not os.path.isdir(session_dir):
+        return None, None, "Not a directory."
+    folder_name = os.path.basename(session_dir.rstrip(os.sep))
+    wavs = sorted(glob.glob(os.path.join(session_dir, "*.wav")))
+    if not wavs:
+        return None, None, "No WAV file found in the folder."
+
+    preferred = os.path.join(session_dir, f"{folder_name}.wav")
+    if os.path.isfile(preferred):
+        wav_path = preferred
+    else:
+        wav_path = wavs[0]
+
+    stem = os.path.splitext(os.path.basename(wav_path))[0]
+    log_path = os.path.join(session_dir, f"{stem}.log.csv")
+    if not os.path.isfile(log_path):
+        log_path = None
+
+    return wav_path, log_path, None
+
+
+def load_detection_intervals_from_csv(log_path):
+    """Read intervals from export log CSV (start_time_s / end_time_s)."""
+    intervals = []
+    if not log_path:
+        return intervals
+    with open(log_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                intervals.append(
+                    {
+                        "start_time": float(row["start_time_s"]),
+                        "end_time": float(row["end_time_s"]),
+                    }
+                )
+            except (KeyError, ValueError):
+                continue
+    return intervals
+
+
+def open_session_spectrogram():
+    """Pick a session folder; show spectrogram from WAV with log overlays (like USV_recorder_analyzer)."""
+    if librosa is None or plt is None or FigureCanvasTkAgg is None:
+        messagebox.showerror(
+            "Missing dependencies",
+            "Spectrogram needs librosa and matplotlib.\n"
+            "Install: pip install librosa matplotlib",
+        )
+        return
+
+    session_dir = filedialog.askdirectory(title="Select recording session folder")
+    if not session_dir:
+        return
+
+    wav_path, log_path, err = find_session_wav_and_log(session_dir)
+    if err:
+        messagebox.showerror("Session folder", err)
+        return
+
+    try:
+        audio_data, sample_rate = librosa.load(wav_path, sr=None)
+    except Exception as e:
+        messagebox.showerror("Load error", f"Failed to load WAV:\n{e}")
+        return
+
+    detections = load_detection_intervals_from_csv(log_path) if log_path else []
+    if log_path is None:
+        messagebox.showwarning(
+            "Log file",
+            "No matching .log.csv found next to the WAV.\n"
+            "Spectrogram will open without detection bands.",
+        )
+
+    win = tk.Toplevel(root)
+    win.title(f"Spectrogram — {os.path.basename(session_dir)}")
+    win.geometry("1000x720")
+
+    show_spec_bands_var = tk.BooleanVar(value=True)
+
+    spec_controls = tk.Frame(win)
+    spec_controls.pack(fill=tk.X, padx=8, pady=(8, 4))
+    tk.Label(spec_controls, text=os.path.basename(wav_path), font=("Arial", 9)).pack(anchor=tk.W)
+    tk.Checkbutton(
+        spec_controls,
+        text="Show detection bands",
+        variable=show_spec_bands_var,
+        command=lambda: create_spectrogram_plot(),
+    ).pack(anchor=tk.W, pady=(4, 0))
+
+    fig_spec, ax_spec = plt.subplots(figsize=(10, 6))
+    canvas_spec = FigureCanvasTkAgg(fig_spec, master=win)
+    canvas_spec.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+    colorbar_spec = {"obj": None}
+
+    def create_spectrogram_plot():
+        """Same STFT / display logic as USV_recorder_analyzer.create_spectrogram."""
+        nonlocal ax_spec
+        if audio_data is None or sample_rate is None:
+            ax_spec.clear()
+            if colorbar_spec["obj"] is not None:
+                try:
+                    colorbar_spec["obj"].remove()
+                except Exception:
+                    pass
+                colorbar_spec["obj"] = None
+            ax_spec.set_title("No audio data")
+            canvas_spec.draw()
+            return
+
+        try:
+            for ax in fig_spec.axes:
+                ax.remove()
+            ax_spec = fig_spec.add_subplot(111)
+            colorbar_spec["obj"] = None
+
+            n_fft = 2048
+            hop_length = 512
+            stft = librosa.stft(audio_data, n_fft=n_fft, hop_length=hop_length)
+            magnitude = np.abs(stft)
+            spectrogram_db = librosa.amplitude_to_db(magnitude, ref=np.max)
+
+            duration = len(audio_data) / sample_rate
+            times = librosa.frames_to_time(
+                np.arange(spectrogram_db.shape[1]),
+                sr=sample_rate,
+                hop_length=hop_length,
+            )
+            freqs = librosa.fft_frequencies(sr=sample_rate, n_fft=n_fft)
+
+            im = ax_spec.imshow(
+                spectrogram_db,
+                aspect="auto",
+                origin="lower",
+                extent=[times[0], times[-1], freqs[0], freqs[-1]],
+                cmap="viridis",
+                interpolation="bilinear",
+            )
+
+            colorbar_spec["obj"] = fig_spec.colorbar(im, ax=ax_spec, label="Magnitude (dB)")
+
+            if detections and show_spec_bands_var.get():
+                for det in detections:
+                    ax_spec.axvspan(det["start_time"], det["end_time"], alpha=0.3, color="red")
+
+            ax_spec.set_xlabel("Time (seconds)")
+            ax_spec.set_ylabel("Frequency (Hz)")
+            ax_spec.set_title("Spectrogram - Raw Audio")
+            ax_spec.set_xlim(0, duration)
+            max_freq_display = min(freqs[-1], 100000)
+            ax_spec.set_ylim(0, max_freq_display)
+            canvas_spec.draw()
+
+        except Exception as e:
+            if ax_spec not in fig_spec.axes:
+                ax_spec = fig_spec.add_subplot(111)
+            else:
+                ax_spec.clear()
+            ax_spec.set_title(f"Error creating spectrogram: {e}")
+            canvas_spec.draw()
+
+    create_spectrogram_plot()
+
+
 root = tk.Tk()
 root.title("Online USV Detector (WAV Export)")
-root.geometry("420x380")
+root.geometry("420x430")
 root.resizable(False, False)
 
 mic_text = dev_name if len(dev_name) <= 32 else dev_name[:29] + "..."
@@ -536,6 +723,14 @@ tk.Entry(params_frame, textvariable=gpio_pin_var, width=10).grid(row=row, column
 
 btn = tk.Button(root, text="Start", command=toggle_run, width=12, height=2, font=("Arial", 12))
 btn.pack(pady=8)
+
+tk.Button(
+    root,
+    text="Spectrogram from session folder…",
+    command=open_session_spectrogram,
+    width=28,
+    font=("Arial", 10),
+).pack(pady=(0, 6))
 
 tk.Label(root, text="Status:", font=("Arial", 10)).pack(anchor=tk.W, padx=10)
 status_frame = tk.Frame(root)
