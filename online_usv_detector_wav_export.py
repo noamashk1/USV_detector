@@ -13,9 +13,11 @@ except ModuleNotFoundError:
 
 import os
 import glob
+import shutil
+import uuid
 
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, simpledialog
 import threading
 
 try:
@@ -44,6 +46,130 @@ THRESHOLD_RMS = 0.6   # default matches analyzer "Ultrasonic Threshold (RMS)"
 LOW_CUT = 50000
 HIGH_CUT = 90000
 GPIO_PIN = 18        # BCM pin for TTL (set from UI at start)
+
+# Finished sessions: records/<session_name>/<session_name>.wav (+ .log.csv)
+RECORDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "records")
+
+
+def sanitize_session_folder_name(name):
+    """Safe folder name under records/. Returns None if empty after cleanup."""
+    if name is None:
+        return None
+    s = str(name).strip()
+    if not s:
+        return None
+    for c in '<>:"/\\|?*':
+        s = s.replace(c, "_")
+    s = s.strip(". ")
+    return s or None
+
+
+def ensure_records_dir():
+    os.makedirs(RECORDS_DIR, exist_ok=True)
+
+
+def create_temp_recording_session_paths():
+    """
+    Create a unique working folder under records/ (name chosen only after Stop).
+    Internal file names are fixed; files are renamed/moved when the user names the session.
+    """
+    ensure_records_dir()
+    while True:
+        sub = f"_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        session_dir = os.path.join(RECORDS_DIR, sub)
+        try:
+            os.makedirs(session_dir, exist_ok=False)
+            break
+        except FileExistsError:
+            continue
+    wav_path = os.path.join(session_dir, "recording.wav")
+    log_path = os.path.join(session_dir, "recording.log.csv")
+    return session_dir, wav_path, log_path
+
+
+def finalize_recording_session(temp_wav_path, temp_log_path):
+    """
+    After Stop: ask for session folder name, move WAV+log to records/<name>/.
+    Cancelling the name dialog offers to discard temp files.
+    """
+    if not temp_wav_path or not os.path.isfile(temp_wav_path):
+        return
+
+    temp_dir = os.path.dirname(os.path.abspath(temp_wav_path))
+    default_name = f"usv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    while True:
+        chosen = simpledialog.askstring(
+            "Save recording",
+            "Session folder name (under records/):\n"
+            "Files: <name>/<name>.wav and <name>.log.csv",
+            initialvalue=default_name,
+            parent=root,
+        )
+
+        if chosen is None:
+            if messagebox.askyesno(
+                "Discard recording?",
+                "Close without a name? Temporary recording files will be deleted.",
+            ):
+                try:
+                    if temp_log_path and os.path.isfile(temp_log_path):
+                        os.remove(temp_log_path)
+                    os.remove(temp_wav_path)
+                    if os.path.isdir(temp_dir) and not os.listdir(temp_dir):
+                        os.rmdir(temp_dir)
+                except OSError as e:
+                    messagebox.showwarning("Cleanup", f"Could not remove temp files:\n{e}")
+                return
+            continue
+
+        safe = sanitize_session_folder_name(chosen)
+        if not safe:
+            messagebox.showerror("Invalid name", "Please use a non-empty folder name.")
+            default_name = chosen.strip() or default_name
+            continue
+        break
+
+    ensure_records_dir()
+    dest_dir = os.path.join(RECORDS_DIR, safe)
+
+    if os.path.exists(dest_dir):
+        if messagebox.askyesno(
+            "Folder exists",
+            f"A folder named '{safe}' already exists.\nReplace it (all contents will be deleted)?",
+        ):
+            try:
+                shutil.rmtree(dest_dir)
+            except OSError as e:
+                messagebox.showerror("Error", f"Could not replace folder:\n{e}")
+                return
+        else:
+            base = safe
+            n = 2
+            while os.path.exists(dest_dir):
+                safe = f"{base}_{n}"
+                dest_dir = os.path.join(RECORDS_DIR, safe)
+                n += 1
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_wav = os.path.join(dest_dir, f"{safe}.wav")
+        dest_log = os.path.join(dest_dir, f"{safe}.log.csv")
+        shutil.move(temp_wav_path, dest_wav)
+        if temp_log_path and os.path.isfile(temp_log_path):
+            shutil.move(temp_log_path, dest_log)
+        try:
+            if os.path.isdir(temp_dir) and not os.listdir(temp_dir):
+                os.rmdir(temp_dir)
+        except OSError:
+            pass
+        print(f"Session folder: {dest_dir}")
+        print(f"Recording saved to: {dest_wav}")
+        if os.path.isfile(dest_log):
+            print(f"Detection log saved to: {dest_log}")
+        messagebox.showinfo("Saved", f"Recording saved to:\n{dest_dir}")
+    except OSError as e:
+        messagebox.showerror("Save error", str(e))
 
 
 class LgpioTTL:
@@ -350,6 +476,12 @@ def stop_recording_and_stream():
     global running, listener_thread, recording_queue, writer_thread, recording_path, dropped_chunks
     global log_queue, log_writer_thread, log_path, log_dropped_rows
     global current_event, last_chunk_end_time_s, last_rms_value
+
+    saved_wav = recording_path
+    saved_log = log_path
+    saved_wav_drops = dropped_chunks
+    saved_log_drops = log_dropped_rows
+
     running = False
     if listener_thread is not None:
         listener_thread.join(timeout=2.0)
@@ -364,11 +496,10 @@ def stop_recording_and_stream():
     if writer_thread is not None:
         writer_thread.join(timeout=5.0)
 
-    if recording_path:
-        print(f"Session folder: {os.path.dirname(recording_path)}")
-        print(f"Recording saved to: {recording_path}")
-        if dropped_chunks > 0:
-            print(f"Dropped WAV chunks: {dropped_chunks}")
+    if saved_wav_drops > 0:
+        print(f"Dropped WAV chunks: {saved_wav_drops}")
+    if saved_log_drops > 0:
+        print(f"Dropped CSV rows (before finalize): {saved_log_drops}")
 
     # If we stopped while still detected, close and log the last interval.
     with event_lock:
@@ -405,11 +536,6 @@ def stop_recording_and_stream():
     if log_writer_thread is not None:
         log_writer_thread.join(timeout=5.0)
 
-    if log_path:
-        print(f"Detection log saved to: {log_path}")
-        if log_dropped_rows > 0:
-            print(f"Dropped CSV rows: {log_dropped_rows}")
-
     recording_queue = None
     writer_thread = None
     recording_path = None
@@ -420,57 +546,35 @@ def stop_recording_and_stream():
     log_path = None
     log_dropped_rows = 0
 
+    return saved_wav, saved_log
+
 
 def toggle_run():
     global running, listener_thread, recording_queue, writer_thread, recording_path, dropped_chunks
     global log_queue, log_writer_thread, log_path, log_dropped_rows
     global samples_processed, last_chunk_end_time_s, last_rms_value, current_event
     if running:
-        stop_recording_and_stream()
+        temp_wav, temp_log = stop_recording_and_stream()
         btn.config(text="Start")
         status_label.config(text="Stopped", bg="gray")
+        if temp_wav:
+            finalize_recording_session(temp_wav, temp_log)
         return
 
     if not apply_params_and_start():
         messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window (ms) >= chunk (ms), GPIO pin >= 0.")
         return
 
-    # Choose session name: a folder with this name is created; WAV + log go inside it.
-    default_name = f"usv_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-    file_path = filedialog.asksaveasfilename(
-        title="Save session (folder name = file name without .wav)",
-        defaultextension=".wav",
-        initialfile=default_name,
-        filetypes=[("WAV files", "*.wav"), ("All files", "*.*")]
-    )
-    if not file_path:
-        # User canceled; do not start streaming.
-        btn.config(text="Start")
-        status_label.config(text="Stopped", bg="gray")
-        return
-
-    if not file_path.lower().endswith(".wav"):
-        file_path += ".wav"
-
-    parent_dir = os.path.dirname(os.path.abspath(file_path))
-    session_basename = os.path.splitext(os.path.basename(file_path))[0]
-    if not session_basename.strip():
-        messagebox.showerror("Invalid name", "Please choose a non-empty file name.")
-        btn.config(text="Start")
-        status_label.config(text="Stopped", bg="gray")
-        return
-
-    session_dir = os.path.join(parent_dir, session_basename)
+    # Record to a temp folder under records/; user names the session after Stop.
     try:
-        os.makedirs(session_dir, exist_ok=True)
+        _tmp_dir, recording_path, log_path = create_temp_recording_session_paths()
+        print(f"Recording (temporary) to: {_tmp_dir}")
     except OSError as e:
-        messagebox.showerror("Folder error", f"Could not create session folder:\n{e}")
+        messagebox.showerror("Folder error", f"Could not create temp session under records/:\n{e}")
         btn.config(text="Start")
         status_label.config(text="Stopped", bg="gray")
         return
 
-    recording_path = os.path.join(session_dir, f"{session_basename}.wav")
-    log_path = os.path.join(session_dir, f"{session_basename}.log.csv")
     dropped_chunks = 0
 
     # Reset timing and event state for this run.
@@ -754,7 +858,9 @@ def on_closing():
     global running
     try:
         if running:
-            stop_recording_and_stream()
+            tw, tl = stop_recording_and_stream()
+            if tw:
+                finalize_recording_session(tw, tl)
     except Exception:
         pass
 
