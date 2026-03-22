@@ -47,12 +47,12 @@ LOW_CUT = 50000
 HIGH_CUT = 90000
 GPIO_PIN = 18        # BCM pin for TTL (set from UI at start)
 
-# Finished sessions: records/<session_name>/<session_name>.wav (+ .log.csv)
-RECORDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "records")
+# Finished sessions: Recordings/<session_name>/<session_name>.wav (+ .log.csv)
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Recordings")
 
 
 def sanitize_session_folder_name(name):
-    """Safe folder name under records/. Returns None if empty after cleanup."""
+    """Safe folder name under Recordings/. Returns None if empty after cleanup."""
     if name is None:
         return None
     s = str(name).strip()
@@ -64,19 +64,19 @@ def sanitize_session_folder_name(name):
     return s or None
 
 
-def ensure_records_dir():
-    os.makedirs(RECORDS_DIR, exist_ok=True)
+def ensure_recordings_dir():
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 
 def create_temp_recording_session_paths():
     """
-    Create a unique working folder under records/ (name chosen only after Stop).
+    Create a unique working folder under Recordings/ (name chosen only after Stop).
     Internal file names are fixed; files are renamed/moved when the user names the session.
     """
-    ensure_records_dir()
+    ensure_recordings_dir()
     while True:
         sub = f"_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        session_dir = os.path.join(RECORDS_DIR, sub)
+        session_dir = os.path.join(RECORDINGS_DIR, sub)
         try:
             os.makedirs(session_dir, exist_ok=False)
             break
@@ -89,7 +89,7 @@ def create_temp_recording_session_paths():
 
 def finalize_recording_session(temp_wav_path, temp_log_path):
     """
-    After Stop: ask for session folder name, move WAV+log to records/<name>/.
+    After Stop: ask for session folder name, move WAV+log to Recordings/<name>/.
     Cancelling the name dialog offers to discard temp files.
     """
     if not temp_wav_path or not os.path.isfile(temp_wav_path):
@@ -101,7 +101,7 @@ def finalize_recording_session(temp_wav_path, temp_log_path):
     while True:
         chosen = simpledialog.askstring(
             "Save recording",
-            "Session folder name (under records/):\n"
+            "Session folder name (under Recordings/):\n"
             "Files: <name>/<name>.wav and <name>.log.csv",
             initialvalue=default_name,
             parent=root,
@@ -130,8 +130,8 @@ def finalize_recording_session(temp_wav_path, temp_log_path):
             continue
         break
 
-    ensure_records_dir()
-    dest_dir = os.path.join(RECORDS_DIR, safe)
+    ensure_recordings_dir()
+    dest_dir = os.path.join(RECORDINGS_DIR, safe)
 
     if os.path.exists(dest_dir):
         if messagebox.askyesno(
@@ -148,7 +148,7 @@ def finalize_recording_session(temp_wav_path, temp_log_path):
             n = 2
             while os.path.exists(dest_dir):
                 safe = f"{base}_{n}"
-                dest_dir = os.path.join(RECORDS_DIR, safe)
+                dest_dir = os.path.join(RECORDINGS_DIR, safe)
                 n += 1
 
     try:
@@ -565,12 +565,12 @@ def toggle_run():
         messagebox.showerror("Invalid parameters", "Check: low < high, all positive, window (ms) >= chunk (ms), GPIO pin >= 0.")
         return
 
-    # Record to a temp folder under records/; user names the session after Stop.
+    # Record to a temp folder under Recordings/; user names the session after Stop.
     try:
         _tmp_dir, recording_path, log_path = create_temp_recording_session_paths()
         print(f"Recording (temporary) to: {_tmp_dir}")
     except OSError as e:
-        messagebox.showerror("Folder error", f"Could not create temp session under records/:\n{e}")
+        messagebox.showerror("Folder error", f"Could not create temp session under Recordings/:\n{e}")
         btn.config(text="Start")
         status_label.config(text="Stopped", bg="gray")
         return
