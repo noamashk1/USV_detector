@@ -30,6 +30,7 @@ except OSError as e:
 import numpy as np
 import scipy.io.wavfile as wav
 import librosa
+import soundfile as sf
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -387,12 +388,26 @@ class USVRecorderAnalyzer:
                     file_path += '.wav'
                 
                 audio_normalized = np.clip(self.audio_data, -1.0, 1.0)
-                audio_int16 = (audio_normalized * 32767).astype(np.int16)
-                wav.write(file_path, self.sample_rate, audio_int16)
+                # Write explicit PCM WAV (RIFF) for maximum compatibility
+                # with downstream readers (scipy wavfile, other analyzers).
+                sf.write(
+                    file=file_path,
+                    data=audio_normalized.astype(np.float32),
+                    samplerate=int(self.sample_rate),
+                    format="WAV",
+                    subtype="PCM_16",
+                    endian="FILE"
+                )
                 
                 messagebox.showinfo("Success", f"Recording saved to:\n{file_path}")
             except Exception as e:
-                messagebox.showerror("Save Error", f"Failed to save:\n{str(e)}")
+                # Fallback to scipy if soundfile write fails
+                try:
+                    audio_int16 = (audio_normalized * 32767).astype(np.int16)
+                    wav.write(file_path, int(self.sample_rate), audio_int16)
+                    messagebox.showinfo("Success", f"Recording saved to:\n{file_path}")
+                except Exception as e2:
+                    messagebox.showerror("Save Error", f"Failed to save:\n{str(e2)}")
     
     def analyze_audio(self):
         """Analyze audio for USV detection"""
