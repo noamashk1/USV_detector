@@ -1,11 +1,19 @@
 import json
 import threading
 import time
+import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
 
 try:
     import lgpio
@@ -15,16 +23,6 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "maze_config.json"
 
-DEFAULT_CONFIG = {
-    "frame_width": 640,
-    "frame_height": 480,
-    "motion_threshold": 500,
-    "pulse_width_s": 0.05,
-    "diff_threshold": 25,
-    "blur_kernel": 21,
-    "zones": [],
-}
-
 ZONE_COLORS = [
     (0, 255, 0),
     (255, 128, 0),
@@ -32,6 +30,15 @@ ZONE_COLORS = [
     (255, 0, 255),
     (255, 255, 0),
     (128, 255, 128),
+]
+
+ZONE_COLORS_RGB = [
+    "#00ff00",
+    "#ff8000",
+    "#00c8ff",
+    "#ff00ff",
+    "#ffff00",
+    "#80ff80",
 ]
 
 
@@ -117,11 +124,14 @@ def load_config(path: Path) -> MazeConfig:
 def save_config(config: MazeConfig, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(config.to_dict(), f, indent=2)
-    print(f"Config saved to {path}")
+        json.dump(config.to_dict(), f, indent=2, ensure_ascii=False)
 
 
-def validate_config(config: MazeConfig, frame_width: int | None = None, frame_height: int | None = None) -> None:
+def validate_config(
+    config: MazeConfig,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+) -> None:
     if not config.zones:
         raise ValueError("Config must contain at least one zone")
 
@@ -157,7 +167,6 @@ class GpioManager:
         if not self._pins:
             return
         if lgpio is None:
-            print("lgpio not available — TTL output disabled")
             return
 
         self._handle = lgpio.gpiochip_open(0)
@@ -167,7 +176,6 @@ class GpioManager:
                 raise RuntimeError(f"lgpio gpio_claim_output failed for GPIO{pin}: {err}")
             lgpio.gpio_write(self._handle, pin, 0)
         self._available = True
-        print(f"TTL output enabled on GPIO pins: {self._pins}")
 
     @property
     def available(self) -> bool:
@@ -201,66 +209,370 @@ class GpioManager:
         self._available = False
 
 
-def choose_startup_mode() -> str:
-    print("\nMaze motion detector — setup")
-    print("  [1] Load config from JSON")
-    print("  [2] Interactive setup (save JSON when done)")
-    while True:
-        choice = input("Choose mode [1/2]: ").strip()
-        if choice in ("1", "2"):
-            return choice
-        print("Invalid choice, enter 1 or 2.")
+class MazeSetupGUI:
+    """All setup via GUI (no console input)."""
 
+    def __init__(self, first_frame: np.ndarray):
+        if ImageTk is None:
+            raise RuntimeError(
+                "Pillow is required for image display in the GUI.\nInstall: pip install Pillow"
+            )
 
-def load_config_interactive() -> tuple[MazeConfig, Path]:
-    default = str(DEFAULT_CONFIG_PATH)
-    path_str = input(f"Config path [{default}]: ").strip() or default
-    path = Path(path_str)
-    if not path.is_file():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    return load_config(path), path
+        self._frame_bgr = first_frame.copy()
+        fh, fw = first_frame.shape[:2]
+        self.config = MazeConfig(frame_width=fw, frame_height=fh)
+        self.config_path = DEFAULT_CONFIG_PATH
+        self.result: tuple[MazeConfig, Path] | None = None
+        self._save_on_start = False
 
+        self._scale = 1.0
+        self._photo: ImageTk.PhotoImage | None = None
+        self._drag_start: tuple[int, int] | None = None
+        self._pending_roi: tuple[int, int, int, int] | None = None
+        self._rect_item: int | None = None
+        self._zone_items: list[int] = []
 
-def setup_zones_interactive(first_frame: np.ndarray, config: MazeConfig) -> MazeConfig:
-    fh, fw = first_frame.shape[:2]
-    config.frame_width = fw
-    config.frame_height = fh
-    config.zones = []
+        self.root = tk.Tk()
+        self.root.title("Maze — Setup")
+        self.root.option_add("*Font", "TkDefaultFont")
+        self._build_ui()
+        self._show_mode_screen()
 
-    print("\nInteractive zone setup")
-    print("Select each ROI with the mouse, then press ENTER or SPACE.")
-    zone_idx = 1
-    while True:
-        title = f"Select ROI for zone {zone_idx}"
-        r = cv2.selectROI(title, first_frame, showCrosshair=True, fromCenter=False)
-        cv2.destroyWindow(title)
-        x, y, w, h = int(r[0]), int(r[1]), int(r[2]), int(r[3])
-        if w == 0 or h == 0:
-            if not config.zones:
-                print("No zone selected. Try again.")
-                continue
-            break
+    def _build_ui(self) -> None:
+        self.container = ttk.Frame(self.root, padding=12)
+        self.container.pack(fill=tk.BOTH, expand=True)
 
-        default_name = f"zone_{zone_idx}"
-        name = input(f"Zone name [{default_name}]: ").strip() or default_name
-        while True:
-            gpio_str = input("GPIO pin (BCM): ").strip()
-            try:
-                gpio = int(gpio_str)
-                break
-            except ValueError:
-                print("Enter a valid integer GPIO number.")
+        self.mode_frame = ttk.Frame(self.container)
+        self.editor_frame = ttk.Frame(self.container)
 
+        # --- Mode selection screen ---
+        ttk.Label(self.mode_frame, text="Maze Motion Detector", font=("", 14, "bold")).pack(
+            anchor="w", pady=(0, 16)
+        )
+        ttk.Label(self.mode_frame, text="Choose setup mode:").pack(anchor="w", pady=(0, 8))
+
+        btn_row = ttk.Frame(self.mode_frame)
+        btn_row.pack(fill=tk.X, pady=8)
+        ttk.Button(
+            btn_row,
+            text="Load settings from JSON",
+            command=self._on_load_json,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            btn_row,
+            text="Interactive setup",
+            command=self._on_interactive,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="Exit", command=self._cancel).pack(side=tk.RIGHT, padx=4)
+
+        # --- Editor screen ---
+        top = ttk.Frame(self.editor_frame)
+        top.pack(fill=tk.BOTH, expand=True)
+
+        canvas_frame = ttk.LabelFrame(top, text="Camera — drag a rectangle to select ROI", padding=4)
+        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self.canvas = tk.Canvas(canvas_frame, bg="#222222", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+        side = ttk.Frame(top, width=280)
+        side.pack(side=tk.RIGHT, fill=tk.Y)
+        side.pack_propagate(False)
+
+        ttk.Label(side, text="Global parameters", font=("", 11, "bold")).pack(anchor="w", pady=(0, 6))
+        self._add_param_row(side, "Motion threshold:", "motion_threshold", "500")
+        self._add_param_row(side, "Pulse width (s):", "pulse_width_s", "0.05")
+        self._add_param_row(side, "Diff threshold:", "diff_threshold", "25")
+        self._add_param_row(side, "Blur kernel:", "blur_kernel", "21")
+
+        zone_box = ttk.LabelFrame(side, text="New zone", padding=6)
+        zone_box.pack(fill=tk.X, pady=10)
+        self.name_var = tk.StringVar(value="zone_1")
+        self.gpio_var = tk.StringVar(value="17")
+        ttk.Label(zone_box, text="Zone name:").pack(anchor="w")
+        ttk.Entry(zone_box, textvariable=self.name_var, width=20).pack(anchor="w", fill=tk.X, pady=2)
+        ttk.Label(zone_box, text="GPIO pin (BCM):").pack(anchor="w", pady=(6, 0))
+        ttk.Entry(zone_box, textvariable=self.gpio_var, width=20).pack(anchor="w", fill=tk.X, pady=2)
+        ttk.Button(zone_box, text="Add zone from selection", command=self._add_zone).pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        list_box = ttk.LabelFrame(side, text="Configured zones", padding=6)
+        list_box.pack(fill=tk.BOTH, expand=True, pady=6)
+        self.zone_list = tk.Listbox(list_box, height=8)
+        self.zone_list.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(list_box, text="Remove selected zone", command=self._remove_zone).pack(anchor="w", pady=4)
+
+        action_row = ttk.Frame(self.editor_frame)
+        action_row.pack(fill=tk.X, pady=(12, 0))
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(action_row, textvariable=self.status_var, foreground="#333").pack(
+            anchor="w", fill=tk.X
+        )
+        btns = ttk.Frame(action_row)
+        btns.pack(fill=tk.X, pady=6)
+        ttk.Button(btns, text="Start monitoring", command=self._on_start).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Save JSON...", command=self._save_as).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Back", command=self._show_mode_screen).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Exit", command=self._cancel).pack(side=tk.RIGHT, padx=4)
+
+    def _add_param_row(self, parent: ttk.Frame, label: str, attr: str, default: str) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=2)
+        var = tk.StringVar(value=default)
+        setattr(self, f"{attr}_var", var)
+        ttk.Label(row, text=label).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=var, width=10).pack(side=tk.LEFT, padx=4)
+
+    def run(self) -> tuple[MazeConfig, Path] | None:
+        self.root.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.root.mainloop()
+        return self.result
+
+    def _show_mode_screen(self) -> None:
+        self.editor_frame.pack_forget()
+        self.mode_frame.pack(fill=tk.BOTH, expand=True)
+        self.root.geometry("480x200")
+
+    def _show_editor_screen(self) -> None:
+        self.mode_frame.pack_forget()
+        self.editor_frame.pack(fill=tk.BOTH, expand=True)
+        self.root.geometry("1000x700")
+        self._render_canvas()
+        self._refresh_zone_list()
+
+    def _on_load_json(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select settings file",
+            initialdir=str(SCRIPT_DIR),
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.config = load_config(Path(path))
+            self.config_path = Path(path)
+            self._save_on_start = False
+            self._sync_params_to_ui()
+            self._show_editor_screen()
+            self.status_var.set(f"Loaded: {path}")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Load error", str(exc), parent=self.root)
+
+    def _on_interactive(self) -> None:
+        fh, fw = self._frame_bgr.shape[:2]
+        self.config = MazeConfig(frame_width=fw, frame_height=fh)
+        self.config.zones = []
+        self.config_path = DEFAULT_CONFIG_PATH
+        self._save_on_start = True
+        self._sync_params_to_ui()
+        self.name_var.set("zone_1")
+        self.gpio_var.set("17")
+        self._show_editor_screen()
+        self.status_var.set("Drag a rectangle, enter name and GPIO, then click 'Add zone from selection'")
+
+    def _sync_params_to_ui(self) -> None:
+        self.motion_threshold_var.set(str(self.config.motion_threshold))
+        self.pulse_width_s_var.set(str(self.config.pulse_width_s))
+        self.diff_threshold_var.set(str(self.config.diff_threshold))
+        self.blur_kernel_var.set(str(self.config.blur_kernel))
+
+    def _apply_params_from_ui(self) -> None:
+        try:
+            self.config.motion_threshold = int(self.motion_threshold_var.get())
+            self.config.pulse_width_s = float(self.pulse_width_s_var.get())
+            self.config.diff_threshold = int(self.diff_threshold_var.get())
+            self.config.blur_kernel = int(self.blur_kernel_var.get())
+        except ValueError as exc:
+            raise ValueError("Invalid global parameter — values must be numeric") from exc
+
+    def _render_canvas(self) -> None:
+        h, w = self._frame_bgr.shape[:2]
+        max_w, max_h = 720, 540
+        self._scale = min(max_w / w, max_h / h, 1.0)
+        disp_w = max(1, int(w * self._scale))
+        disp_h = max(1, int(h * self._scale))
+        resized = cv2.resize(self._frame_bgr, (disp_w, disp_h))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.config(width=disp_w, height=disp_h)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+        self._zone_items.clear()
+        self._rect_item = None
+        self._pending_roi = None
+        for i, zone in enumerate(self.config.zones):
+            self._draw_zone_rect(zone, i)
+
+    def _canvas_to_frame(self, cx: int, cy: int) -> tuple[int, int]:
+        return int(cx / self._scale), int(cy / self._scale)
+
+    def _on_press(self, event: tk.Event) -> None:
+        self._drag_start = (event.x, event.y)
+        if self._rect_item is not None:
+            self.canvas.delete(self._rect_item)
+            self._rect_item = None
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        if self._rect_item is not None:
+            self.canvas.delete(self._rect_item)
+        self._rect_item = self.canvas.create_rectangle(
+            x0, y0, event.x, event.y, outline="#ffff00", width=2
+        )
+
+    def _on_release(self, event: tk.Event) -> None:
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        self._drag_start = None
+        fx0, fy0 = self._canvas_to_frame(min(x0, event.x), min(y0, event.y))
+        fx1, fy1 = self._canvas_to_frame(max(x0, event.x), max(y0, event.y))
+        w, h = fx1 - fx0, fy1 - fy0
+        if w > 5 and h > 5:
+            self._pending_roi = (fx0, fy0, w, h)
+            self.status_var.set(f"Selected ROI: ({fx0},{fy0}) {w}x{h} — click 'Add zone from selection'")
+        else:
+            self._pending_roi = None
+            self.status_var.set("Selection too small — try again")
+
+    def _draw_zone_rect(self, zone: RoiZone, index: int) -> None:
+        x = int(zone.x * self._scale)
+        y = int(zone.y * self._scale)
+        w = int(zone.w * self._scale)
+        h = int(zone.h * self._scale)
+        color = ZONE_COLORS_RGB[index % len(ZONE_COLORS_RGB)]
+        rid = self.canvas.create_rectangle(x, y, x + w, y + h, outline=color, width=2)
+        self._zone_items.append(rid)
+        self.canvas.create_text(
+            x + 4, y + 14, anchor=tk.NW, text=f"{zone.name} GPIO{zone.gpio}", fill=color
+        )
+
+    def _refresh_zone_list(self) -> None:
+        self.zone_list.delete(0, tk.END)
+        for z in self.config.zones:
+            self.zone_list.insert(
+                tk.END, f"{z.name}  |  ({z.x},{z.y}) {z.w}x{z.h}  |  GPIO{z.gpio}"
+            )
+
+    def _add_zone(self) -> None:
+        if self._pending_roi is None:
+            messagebox.showwarning(
+                "No selection",
+                "Drag a rectangle on the image before adding a zone.",
+                parent=self.root,
+            )
+            return
+        name = self.name_var.get().strip() or f"zone_{len(self.config.zones) + 1}"
+        try:
+            gpio = int(self.gpio_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Invalid GPIO", "Enter an integer GPIO pin number.", parent=self.root)
+            return
+
+        x, y, w, h = self._pending_roi
         zone = RoiZone(name=name, x=x, y=y, w=w, h=h, gpio=gpio)
-        config.zones.append(zone)
-        validate_config(config, frame_width=fw, frame_height=fh)
+        try:
+            self._apply_params_from_ui()
+            trial = MazeConfig(
+                frame_width=self.config.frame_width,
+                frame_height=self.config.frame_height,
+                motion_threshold=self.config.motion_threshold,
+                pulse_width_s=self.config.pulse_width_s,
+                diff_threshold=self.config.diff_threshold,
+                blur_kernel=self.config.blur_kernel,
+                zones=self.config.zones + [zone],
+            )
+            validate_config(
+                trial,
+                frame_width=self.config.frame_width,
+                frame_height=self.config.frame_height,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Error", str(exc), parent=self.root)
+            return
 
-        more = input("Add another zone? [y/N]: ").strip().lower()
-        if more not in ("y", "yes"):
-            break
-        zone_idx += 1
+        self.config.zones.append(zone)
+        self._pending_roi = None
+        if self._rect_item is not None:
+            self.canvas.delete(self._rect_item)
+            self._rect_item = None
+        self._render_canvas()
+        self._refresh_zone_list()
+        self.name_var.set(f"zone_{len(self.config.zones) + 1}")
+        self.status_var.set(f"Added zone '{name}' (GPIO{gpio})")
 
-    return config
+    def _remove_zone(self) -> None:
+        sel = self.zone_list.curselection()
+        if not sel:
+            messagebox.showwarning(
+                "Nothing selected", "Select a zone from the list to remove.", parent=self.root
+            )
+            return
+        idx = sel[0]
+        del self.config.zones[idx]
+        self._render_canvas()
+        self._refresh_zone_list()
+        self.status_var.set("Zone removed")
+
+    def _save_as(self) -> None:
+        try:
+            self._apply_params_from_ui()
+            validate_config(
+                self.config,
+                frame_width=self.config.frame_width,
+                frame_height=self.config.frame_height,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Error", str(exc), parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save settings",
+            initialdir=str(SCRIPT_DIR),
+            initialfile="maze_config.json",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            save_config(self.config, Path(path))
+            self.config_path = Path(path)
+            self.status_var.set(f"Saved: {path}")
+            messagebox.showinfo("Saved", f"Settings saved to:\n{path}", parent=self.root)
+        except OSError as exc:
+            messagebox.showerror("Save error", str(exc), parent=self.root)
+
+    def _on_start(self) -> None:
+        try:
+            self._apply_params_from_ui()
+            validate_config(
+                self.config,
+                frame_width=self.config.frame_width,
+                frame_height=self.config.frame_height,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Error", str(exc), parent=self.root)
+            return
+
+        if self._save_on_start:
+            try:
+                save_config(self.config, self.config_path)
+            except OSError as exc:
+                messagebox.showerror("Save error", str(exc), parent=self.root)
+                return
+
+        self.result = (self.config, self.config_path)
+        self.root.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.root.destroy()
 
 
 def init_baselines(zones: list[RoiZone], gray_frame: np.ndarray, blur_kernel: int) -> None:
@@ -316,69 +628,31 @@ def open_camera(config: MazeConfig) -> cv2.VideoCapture:
     return cap
 
 
-def main() -> None:
-    mode = choose_startup_mode()
-    config_path = DEFAULT_CONFIG_PATH
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Camera error")
-        return
-
-    ret, first_frame = cap.read()
-    if not ret:
-        cap.release()
-        print("Camera error: could not read first frame")
-        return
-
-    actual_h, actual_w = first_frame.shape[:2]
-
-    if mode == "1":
-        cap.release()
-        try:
-            config, config_path = load_config_interactive()
-        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
-            print(f"Failed to load config: {exc}")
-            return
-        cap = open_camera(config)
-        ret, first_frame = cap.read()
-        if not ret:
-            cap.release()
-            print("Camera error after reopen")
-            return
-        actual_h, actual_w = first_frame.shape[:2]
-        validate_config(config, frame_width=actual_w, frame_height=actual_h)
-    else:
-        config = MazeConfig.from_dict(DEFAULT_CONFIG)
-        config.frame_width = actual_w
-        config.frame_height = actual_h
-        try:
-            config = setup_zones_interactive(first_frame, config)
-        except ValueError as exc:
-            cap.release()
-            print(f"Setup error: {exc}")
-            return
-
-        save_path_str = input(f"Save config to [{config_path}]: ").strip()
-        config_path = Path(save_path_str) if save_path_str else config_path
-        save_config(config, config_path)
-
+def run_monitoring(cap: cv2.VideoCapture, config: MazeConfig, first_frame: np.ndarray) -> None:
     first_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
     init_baselines(config.zones, first_gray, config.blur_kernel)
 
-    gpio = GpioManager(
-        pins=[z.gpio for z in config.zones],
-        pulse_width_s=config.pulse_width_s,
-    )
+    gpio: GpioManager | None = None
+    try:
+        gpio = GpioManager(
+            pins=[z.gpio for z in config.zones],
+            pulse_width_s=config.pulse_width_s,
+        )
+    except RuntimeError as exc:
+        messagebox.showerror("GPIO error", str(exc))
+        return
 
-    print(f"\nMonitoring {len(config.zones)} zone(s). Press 'q' to stop.")
-    for zone in config.zones:
-        print(f"  - {zone.name}: ROI ({zone.x},{zone.y}) {zone.w}x{zone.h} -> GPIO{zone.gpio}")
+    if gpio is not None and not gpio.available and lgpio is None:
+        messagebox.showwarning(
+            "GPIO unavailable",
+            "lgpio is not installed — monitoring will continue without TTL output.",
+        )
 
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
+                messagebox.showerror("Camera", "Failed to read frame from camera")
                 break
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -407,15 +681,93 @@ def main() -> None:
                 )
 
             draw_zones(frame, config.zones, active)
+            cv2.putText(
+                frame,
+                "Press Q to stop",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
             cv2.imshow("Lab Feed", frame)
             cv2.imshow("Motion Mask", combined_mask)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
-        cap.release()
+        if gpio is not None:
+            gpio.close()
         cv2.destroyAllWindows()
-        gpio.close()
+
+
+def main() -> None:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Camera", "Could not open camera")
+        root.destroy()
+        return
+
+    ret, first_frame = cap.read()
+    if not ret:
+        cap.release()
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Camera", "Could not read frame from camera")
+        root.destroy()
+        return
+
+    try:
+        setup = MazeSetupGUI(first_frame)
+        result = setup.run()
+    except RuntimeError as exc:
+        cap.release()
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Error", str(exc))
+        root.destroy()
+        return
+
+    if result is None:
+        cap.release()
+        return
+
+    config, _config_path = result
+    cap.release()
+
+    cap = open_camera(config)
+    if not cap.isOpened():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Camera", "Could not open camera for monitoring")
+        root.destroy()
+        return
+
+    ret, first_frame = cap.read()
+    if not ret:
+        cap.release()
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Camera", "Could not read frame for monitoring")
+        root.destroy()
+        return
+
+    try:
+        validate_config(config, frame_width=first_frame.shape[1], frame_height=first_frame.shape[0])
+    except ValueError as exc:
+        cap.release()
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Config error", str(exc))
+        root.destroy()
+        return
+
+    try:
+        run_monitoring(cap, config, first_frame)
+    finally:
+        cap.release()
 
 
 if __name__ == "__main__":
