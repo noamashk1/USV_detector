@@ -556,6 +556,20 @@ def run_monitoring(cap: cv2.VideoCapture, config: MazeConfig, first_frame: np.nd
     runtime.latest_gray = gray0
     gpio_lock = threading.Lock()
     gpio = GpioManager([z.gpio for z in config.zones], config.pulse_width_s)
+    drag_state = {
+        "mode": None,  # None | "move" | "resize"
+        "zone_name": None,
+        "offset_x": 0,
+        "offset_y": 0,
+        "start_x": 0,
+        "start_y": 0,
+        "orig_x": 0,
+        "orig_y": 0,
+        "orig_w": 0,
+        "orig_h": 0,
+    }
+    resize_handle_px = 14
+    min_zone_size = 12
 
     def rebuild_gpio_if_needed():
         nonlocal gpio
@@ -568,7 +582,76 @@ def run_monitoring(cap: cv2.VideoCapture, config: MazeConfig, first_frame: np.nd
 
     RuntimeControlPanel(config, runtime, gray0.shape, rebuild_gpio_if_needed).start()
 
+    def reinit_zone_background(zone: RoiZone) -> None:
+        if runtime.latest_gray is None:
+            return
+        roi = runtime.latest_gray[zone.y : zone.y + zone.h, zone.x : zone.x + zone.w]
+        if roi.size == 0:
+            return
+        zone.background = cv2.GaussianBlur(roi, (config.blur_kernel, config.blur_kernel), 0).astype(np.float32)
+        zone.consecutive_count = 0
+        zone.last_trigger_time = 0.0
+
+    def on_lab_mouse(event, x, y, _flags, _param):
+        with runtime.lock:
+            zones = config.zones
+            if event == cv2.EVENT_LBUTTONDOWN:
+                for zone in reversed(zones):
+                    in_zone = zone.x <= x <= zone.x + zone.w and zone.y <= y <= zone.y + zone.h
+                    if not in_zone:
+                        continue
+                    near_corner = (
+                        abs(x - (zone.x + zone.w)) <= resize_handle_px
+                        and abs(y - (zone.y + zone.h)) <= resize_handle_px
+                    )
+                    drag_state["zone_name"] = zone.name
+                    if near_corner:
+                        drag_state["mode"] = "resize"
+                        drag_state["start_x"] = x
+                        drag_state["start_y"] = y
+                        drag_state["orig_w"] = zone.w
+                        drag_state["orig_h"] = zone.h
+                    else:
+                        drag_state["mode"] = "move"
+                        drag_state["offset_x"] = x - zone.x
+                        drag_state["offset_y"] = y - zone.y
+                    drag_state["orig_x"] = zone.x
+                    drag_state["orig_y"] = zone.y
+                    break
+
+            elif event == cv2.EVENT_MOUSEMOVE and drag_state["mode"] is not None:
+                zone = next((z for z in zones if z.name == drag_state["zone_name"]), None)
+                if zone is None:
+                    drag_state["mode"] = None
+                    return
+                if drag_state["mode"] == "move":
+                    new_x = x - drag_state["offset_x"]
+                    new_y = y - drag_state["offset_y"]
+                    zone.x = max(0, min(new_x, config.frame_width - zone.w))
+                    zone.y = max(0, min(new_y, config.frame_height - zone.h))
+                else:
+                    dx = x - drag_state["start_x"]
+                    dy = y - drag_state["start_y"]
+                    zone.w = max(min_zone_size, min(drag_state["orig_w"] + dx, config.frame_width - zone.x))
+                    zone.h = max(min_zone_size, min(drag_state["orig_h"] + dy, config.frame_height - zone.y))
+
+            elif event == cv2.EVENT_LBUTTONUP and drag_state["mode"] is not None:
+                zone = next((z for z in zones if z.name == drag_state["zone_name"]), None)
+                if zone is not None:
+                    moved_or_resized = (
+                        zone.x != drag_state["orig_x"]
+                        or zone.y != drag_state["orig_y"]
+                        or zone.w != drag_state["orig_w"]
+                        or zone.h != drag_state["orig_h"]
+                    )
+                    if moved_or_resized:
+                        reinit_zone_background(zone)
+                drag_state["mode"] = None
+                drag_state["zone_name"] = None
+
     try:
+        cv2.namedWindow("Lab Feed")
+        cv2.setMouseCallback("Lab Feed", on_lab_mouse)
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -602,7 +685,15 @@ def run_monitoring(cap: cv2.VideoCapture, config: MazeConfig, first_frame: np.nd
                     if z.name in zone_by_name:
                         config.zones[i] = zone_by_name[z.name]
             draw_zones(frame, zones, active, debug)
-            cv2.putText(frame, "Q=quit | Runtime Control window stays live", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(
+                frame,
+                "Q=quit | Drag zone to move | Drag bottom-right corner to resize",
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+            )
             cv2.imshow("Lab Feed", frame)
             cv2.imshow("Motion Mask", combined_mask)
             if cv2.waitKey(1) & 0xFF == ord("q"):
