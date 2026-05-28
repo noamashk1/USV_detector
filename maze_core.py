@@ -220,7 +220,17 @@ def init_zone_runtime(zones: list[RoiZone], gray_frame: np.ndarray, blur_kernel:
 
 
 def process_zone(zone: RoiZone, gray: np.ndarray, config: MazeConfig) -> tuple[bool, np.ndarray, float]:
-    roi_blurred = cv2.GaussianBlur(gray[zone.y : zone.y + zone.h, zone.x : zone.x + zone.w], (config.blur_kernel, config.blur_kernel), 0)
+    roi = gray[zone.y : zone.y + zone.h, zone.x : zone.x + zone.w]
+    roi_blurred = cv2.GaussianBlur(roi, (config.blur_kernel, config.blur_kernel), 0)
+    # Zone size can change live while dragging; keep background shape aligned.
+    if (
+        zone.background is None
+        or zone.background.shape[0] != roi_blurred.shape[0]
+        or zone.background.shape[1] != roi_blurred.shape[1]
+    ):
+        zone.background = roi_blurred.astype(np.float32)
+        zone.consecutive_count = 0
+        zone.last_trigger_time = 0.0
     diff = cv2.absdiff(cv2.convertScaleAbs(zone.background), roi_blurred)
     threshold = max(float(config.diff_threshold), float(np.std(diff)) * config.adaptive_k_sigma) if config.use_adaptive_threshold else float(config.diff_threshold)
     mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)[1]
