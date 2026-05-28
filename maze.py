@@ -3,6 +3,12 @@ from maze_core import main
 
 if __name__ == "__main__":
     main()
+    raise SystemExit
+from maze_core import main
+
+
+if __name__ == "__main__":
+    main()
 import json
 import threading
 import time

@@ -22,15 +22,7 @@ except ImportError:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "maze_config.json"
-
-ZONE_COLORS = [
-    (0, 255, 0),
-    (255, 128, 0),
-    (0, 200, 255),
-    (255, 0, 255),
-    (255, 255, 0),
-    (128, 255, 128),
-]
+ZONE_COLORS = [(0, 255, 0), (255, 128, 0), (0, 200, 255), (255, 0, 255), (255, 255, 0), (128, 255, 128)]
 ZONE_COLORS_RGB = ["#00ff00", "#ff8000", "#00c8ff", "#ff00ff", "#ffff00", "#80ff80"]
 
 
@@ -54,14 +46,7 @@ class RoiZone:
 
     @classmethod
     def from_dict(cls, data: dict) -> "RoiZone":
-        return cls(
-            name=str(data["name"]),
-            x=int(data["x"]),
-            y=int(data["y"]),
-            w=int(data["w"]),
-            h=int(data["h"]),
-            gpio=int(data["gpio"]),
-        )
+        return cls(name=str(data["name"]), x=int(data["x"]), y=int(data["y"]), w=int(data["w"]), h=int(data["h"]), gpio=int(data["gpio"]))
 
 
 @dataclass
@@ -122,6 +107,13 @@ class MazeConfig:
         )
 
 
+@dataclass
+class RuntimeState:
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    latest_gray: np.ndarray | None = field(default=None, repr=False)
+    running: bool = True
+
+
 def load_config(path: Path) -> MazeConfig:
     with path.open(encoding="utf-8") as f:
         config = MazeConfig.from_dict(json.load(f))
@@ -152,7 +144,6 @@ def validate_config(config: MazeConfig, frame_width: int | None = None, frame_he
         raise ValueError("morph iterations must be >= 0")
     if config.adaptive_k_sigma <= 0:
         raise ValueError("adaptive_k_sigma must be > 0")
-
     fw = frame_width if frame_width is not None else config.frame_width
     fh = frame_height if frame_height is not None else config.frame_height
     names: set[str] = set()
@@ -191,6 +182,9 @@ class GpioManager:
     def available(self) -> bool:
         return self._available
 
+    def has_same_pins(self, pins: list[int]) -> bool:
+        return sorted(set(pins)) == self._pins
+
     def pulse_async(self, pin: int) -> None:
         if not self._available:
             return
@@ -217,6 +211,199 @@ class GpioManager:
         lgpio.gpiochip_close(self._handle)
 
 
+def init_zone_runtime(zones: list[RoiZone], gray_frame: np.ndarray, blur_kernel: int) -> None:
+    k = (blur_kernel, blur_kernel)
+    for zone in zones:
+        zone.background = cv2.GaussianBlur(gray_frame[zone.y : zone.y + zone.h, zone.x : zone.x + zone.w], k, 0).astype(np.float32)
+        zone.consecutive_count = 0
+        zone.last_trigger_time = 0.0
+
+
+def process_zone(zone: RoiZone, gray: np.ndarray, config: MazeConfig) -> tuple[bool, np.ndarray, float]:
+    roi_blurred = cv2.GaussianBlur(gray[zone.y : zone.y + zone.h, zone.x : zone.x + zone.w], (config.blur_kernel, config.blur_kernel), 0)
+    diff = cv2.absdiff(cv2.convertScaleAbs(zone.background), roi_blurred)
+    threshold = max(float(config.diff_threshold), float(np.std(diff)) * config.adaptive_k_sigma) if config.use_adaptive_threshold else float(config.diff_threshold)
+    mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)[1]
+    kernel = np.ones((config.morph_kernel_size, config.morph_kernel_size), dtype=np.uint8)
+    if config.morph_open_iterations > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=config.morph_open_iterations)
+    if config.morph_close_iterations > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=config.morph_close_iterations)
+    motion_amount = float(np.sum(mask) / 255.0)
+    cv2.accumulateWeighted(roi_blurred.astype(np.float32), zone.background, config.background_alpha)
+    return motion_amount > config.motion_threshold, mask, motion_amount
+
+
+class RuntimeControlPanel:
+    def __init__(self, config: MazeConfig, runtime: RuntimeState, frame_shape: tuple[int, int], on_gpio_change):
+        self.config = config
+        self.runtime = runtime
+        self.frame_h, self.frame_w = frame_shape
+        self.on_gpio_change = on_gpio_change
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        root = tk.Tk()
+        root.title("Runtime Control")
+        root.geometry("540x620")
+        p = ttk.Frame(root, padding=10)
+        p.pack(fill=tk.BOTH, expand=True)
+
+        fields = {}
+        for label, key in [
+            ("motion_threshold", "motion_threshold"),
+            ("diff_threshold", "diff_threshold"),
+            ("background_alpha", "background_alpha"),
+            ("min_consecutive_frames", "min_consecutive_frames"),
+            ("cooldown_s", "cooldown_s"),
+            ("morph_kernel_size", "morph_kernel_size"),
+            ("morph_open_iterations", "morph_open_iterations"),
+            ("morph_close_iterations", "morph_close_iterations"),
+            ("adaptive_k_sigma", "adaptive_k_sigma"),
+        ]:
+            r = ttk.Frame(p)
+            r.pack(fill=tk.X, pady=2)
+            ttk.Label(r, text=label, width=22).pack(side=tk.LEFT)
+            var = tk.StringVar()
+            ttk.Entry(r, textvariable=var, width=14).pack(side=tk.LEFT)
+            fields[key] = var
+
+        use_adapt = tk.BooleanVar(value=False)
+        ttk.Checkbutton(p, text="use_adaptive_threshold", variable=use_adapt).pack(anchor="w", pady=4)
+
+        ttk.Label(p, text="Zones (name | x y w h gpio)").pack(anchor="w", pady=(10, 2))
+        zones_list = tk.Listbox(p, height=10)
+        zones_list.pack(fill=tk.BOTH, expand=True)
+
+        edit = ttk.Frame(p)
+        edit.pack(fill=tk.X, pady=6)
+        z_name = tk.StringVar()
+        z_x = tk.StringVar()
+        z_y = tk.StringVar()
+        z_w = tk.StringVar()
+        z_h = tk.StringVar()
+        z_gpio = tk.StringVar()
+        for txt, var, width in [("name", z_name, 10), ("x", z_x, 4), ("y", z_y, 4), ("w", z_w, 4), ("h", z_h, 4), ("gpio", z_gpio, 5)]:
+            ttk.Label(edit, text=txt).pack(side=tk.LEFT)
+            ttk.Entry(edit, textvariable=var, width=width).pack(side=tk.LEFT, padx=2)
+
+        status = tk.StringVar(value="")
+        ttk.Label(p, textvariable=status).pack(anchor="w", pady=(2, 6))
+
+        def refresh():
+            with self.runtime.lock:
+                fields["motion_threshold"].set(str(self.config.motion_threshold))
+                fields["diff_threshold"].set(str(self.config.diff_threshold))
+                fields["background_alpha"].set(str(self.config.background_alpha))
+                fields["min_consecutive_frames"].set(str(self.config.min_consecutive_frames))
+                fields["cooldown_s"].set(str(self.config.cooldown_s))
+                fields["morph_kernel_size"].set(str(self.config.morph_kernel_size))
+                fields["morph_open_iterations"].set(str(self.config.morph_open_iterations))
+                fields["morph_close_iterations"].set(str(self.config.morph_close_iterations))
+                fields["adaptive_k_sigma"].set(str(self.config.adaptive_k_sigma))
+                use_adapt.set(bool(self.config.use_adaptive_threshold))
+                zones = list(self.config.zones)
+            zones_list.delete(0, tk.END)
+            for z in zones:
+                zones_list.insert(tk.END, f"{z.name} | {z.x} {z.y} {z.w} {z.h} {z.gpio}")
+
+        def apply_params():
+            try:
+                with self.runtime.lock:
+                    self.config.motion_threshold = int(fields["motion_threshold"].get())
+                    self.config.diff_threshold = int(fields["diff_threshold"].get())
+                    self.config.background_alpha = float(fields["background_alpha"].get())
+                    self.config.min_consecutive_frames = int(fields["min_consecutive_frames"].get())
+                    self.config.cooldown_s = float(fields["cooldown_s"].get())
+                    self.config.morph_kernel_size = int(fields["morph_kernel_size"].get())
+                    self.config.morph_open_iterations = int(fields["morph_open_iterations"].get())
+                    self.config.morph_close_iterations = int(fields["morph_close_iterations"].get())
+                    self.config.adaptive_k_sigma = float(fields["adaptive_k_sigma"].get())
+                    self.config.use_adaptive_threshold = bool(use_adapt.get())
+                    validate_config(self.config, frame_width=self.frame_w, frame_height=self.frame_h)
+                status.set("Parameters applied")
+            except Exception as exc:
+                status.set(f"Error: {exc}")
+
+        def load_selected():
+            idx = zones_list.curselection()
+            if not idx:
+                return
+            with self.runtime.lock:
+                z = self.config.zones[idx[0]]
+            z_name.set(z.name); z_x.set(str(z.x)); z_y.set(str(z.y)); z_w.set(str(z.w)); z_h.set(str(z.h)); z_gpio.set(str(z.gpio))
+
+        def _new_zone_from_inputs() -> RoiZone:
+            return RoiZone(name=z_name.get().strip(), x=int(z_x.get()), y=int(z_y.get()), w=int(z_w.get()), h=int(z_h.get()), gpio=int(z_gpio.get()))
+
+        def _init_zone_bg(z: RoiZone):
+            if self.runtime.latest_gray is None:
+                return
+            roi = self.runtime.latest_gray[z.y : z.y + z.h, z.x : z.x + z.w]
+            if roi.size == 0:
+                return
+            z.background = cv2.GaussianBlur(roi, (self.config.blur_kernel, self.config.blur_kernel), 0).astype(np.float32)
+            z.consecutive_count = 0
+            z.last_trigger_time = 0.0
+
+        def add_zone():
+            try:
+                nz = _new_zone_from_inputs()
+                with self.runtime.lock:
+                    self.config.zones.append(nz)
+                    validate_config(self.config, frame_width=self.frame_w, frame_height=self.frame_h)
+                    _init_zone_bg(nz)
+                    self.on_gpio_change()
+                refresh()
+                status.set("Zone added")
+            except Exception as exc:
+                status.set(f"Error: {exc}")
+
+        def update_zone():
+            idx = zones_list.curselection()
+            if not idx:
+                status.set("Select zone first")
+                return
+            try:
+                uz = _new_zone_from_inputs()
+                with self.runtime.lock:
+                    self.config.zones[idx[0]] = uz
+                    validate_config(self.config, frame_width=self.frame_w, frame_height=self.frame_h)
+                    _init_zone_bg(uz)
+                    self.on_gpio_change()
+                refresh()
+                status.set("Zone updated")
+            except Exception as exc:
+                status.set(f"Error: {exc}")
+
+        def delete_zone():
+            idx = zones_list.curselection()
+            if not idx:
+                return
+            with self.runtime.lock:
+                del self.config.zones[idx[0]]
+                if not self.config.zones:
+                    status.set("Need at least one zone")
+                    return
+                self.on_gpio_change()
+            refresh()
+            status.set("Zone deleted")
+
+        btns = ttk.Frame(p)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Apply params", command=apply_params).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Load selected", command=load_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Add zone", command=add_zone).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Update zone", command=update_zone).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Delete zone", command=delete_zone).pack(side=tk.LEFT, padx=2)
+
+        refresh()
+        root.protocol("WM_DELETE_WINDOW", root.withdraw)
+        root.mainloop()
+
+
 class MazeSetupGUI:
     def __init__(self, first_frame: np.ndarray):
         if ImageTk is None:
@@ -228,339 +415,131 @@ class MazeSetupGUI:
         self.result: tuple[MazeConfig, Path] | None = None
         self._save_on_start = False
         self._scale = 1.0
-        self._photo: ImageTk.PhotoImage | None = None
-        self._drag_start: tuple[int, int] | None = None
-        self._pending_roi: tuple[int, int, int, int] | None = None
-        self._rect_item: int | None = None
-
+        self._photo = None
+        self._drag_start = None
+        self._pending_roi = None
+        self._rect_item = None
         self.root = tk.Tk()
         self.root.title("Maze — Setup")
         self._build_ui()
         self._show_mode_screen()
 
-    def _build_ui(self) -> None:
-        self.container = ttk.Frame(self.root, padding=12)
-        self.container.pack(fill=tk.BOTH, expand=True)
-        self.mode_frame = ttk.Frame(self.container)
-        self.editor_frame = ttk.Frame(self.container)
-
+    def _build_ui(self):
+        self.container = ttk.Frame(self.root, padding=12); self.container.pack(fill=tk.BOTH, expand=True)
+        self.mode_frame = ttk.Frame(self.container); self.editor_frame = ttk.Frame(self.container)
         ttk.Label(self.mode_frame, text="Maze Motion Detector", font=("", 14, "bold")).pack(anchor="w", pady=(0, 16))
-        ttk.Label(self.mode_frame, text="Choose setup mode:").pack(anchor="w", pady=(0, 8))
-        r = ttk.Frame(self.mode_frame)
-        r.pack(fill=tk.X, pady=8)
-        ttk.Button(r, text="Load settings from JSON", command=self._on_load_json).pack(side=tk.LEFT, padx=4)
-        ttk.Button(r, text="Interactive setup", command=self._on_interactive).pack(side=tk.LEFT, padx=4)
-        ttk.Button(r, text="Exit", command=self._cancel).pack(side=tk.RIGHT, padx=4)
-
-        top = ttk.Frame(self.editor_frame)
-        top.pack(fill=tk.BOTH, expand=True)
-        canvas_frame = ttk.LabelFrame(top, text="Camera — drag rectangle to select ROI", padding=4)
-        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
-        self.canvas = tk.Canvas(canvas_frame, bg="#222", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-
-        side = ttk.Frame(top, width=320)
-        side.pack(side=tk.RIGHT, fill=tk.Y)
-        side.pack_propagate(False)
-        ttk.Label(side, text="Global parameters", font=("", 11, "bold")).pack(anchor="w", pady=(0, 6))
-        self._add_param_row(side, "Motion threshold:", "motion_threshold", "500")
-        self._add_param_row(side, "Pulse width (s):", "pulse_width_s", "0.05")
-        self._add_param_row(side, "Diff threshold:", "diff_threshold", "25")
-        self._add_param_row(side, "Blur kernel:", "blur_kernel", "21")
-        self._add_param_row(side, "Background alpha:", "background_alpha", "0.02")
-        self._add_param_row(side, "Min consecutive frames:", "min_consecutive_frames", "2")
-        self._add_param_row(side, "Cooldown (s):", "cooldown_s", "0.3")
-        self._add_param_row(side, "Morph kernel size:", "morph_kernel_size", "3")
-        self._add_param_row(side, "Morph open iterations:", "morph_open_iterations", "1")
-        self._add_param_row(side, "Morph close iterations:", "morph_close_iterations", "1")
-        self._add_param_row(side, "Adaptive k sigma:", "adaptive_k_sigma", "2.5")
-        self.use_adaptive_threshold_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(side, text="Use adaptive threshold", variable=self.use_adaptive_threshold_var).pack(anchor="w", pady=(2, 8))
-
-        zone_box = ttk.LabelFrame(side, text="New zone", padding=6)
-        zone_box.pack(fill=tk.X, pady=8)
-        self.name_var = tk.StringVar(value="zone_1")
-        self.gpio_var = tk.StringVar(value="17")
-        ttk.Label(zone_box, text="Zone name:").pack(anchor="w")
-        ttk.Entry(zone_box, textvariable=self.name_var, width=20).pack(anchor="w", fill=tk.X, pady=2)
-        ttk.Label(zone_box, text="GPIO pin (BCM):").pack(anchor="w", pady=(6, 0))
-        ttk.Entry(zone_box, textvariable=self.gpio_var, width=20).pack(anchor="w", fill=tk.X, pady=2)
-        ttk.Button(zone_box, text="Add zone from selection", command=self._add_zone).pack(anchor="w", pady=(8, 0))
-
-        list_box = ttk.LabelFrame(side, text="Configured zones", padding=6)
-        list_box.pack(fill=tk.BOTH, expand=True, pady=6)
-        self.zone_list = tk.Listbox(list_box, height=8)
-        self.zone_list.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(list_box, text="Remove selected zone", command=self._remove_zone).pack(anchor="w", pady=4)
-
-        action = ttk.Frame(self.editor_frame)
-        action.pack(fill=tk.X, pady=(12, 0))
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(action, textvariable=self.status_var, foreground="#333").pack(anchor="w", fill=tk.X)
-        b = ttk.Frame(action)
-        b.pack(fill=tk.X, pady=6)
+        ttk.Button(self.mode_frame, text="Load settings from JSON", command=self._on_load_json).pack(anchor="w", pady=4)
+        ttk.Button(self.mode_frame, text="Interactive setup", command=self._on_interactive).pack(anchor="w", pady=4)
+        ttk.Button(self.mode_frame, text="Exit", command=self._cancel).pack(anchor="w", pady=8)
+        top = ttk.Frame(self.editor_frame); top.pack(fill=tk.BOTH, expand=True)
+        canvas_frame = ttk.LabelFrame(top, text="Camera — drag rectangle to select ROI", padding=4); canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self.canvas = tk.Canvas(canvas_frame, bg="#222", highlightthickness=0); self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<ButtonPress-1>", self._on_press); self.canvas.bind("<B1-Motion>", self._on_drag); self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        side = ttk.Frame(top, width=320); side.pack(side=tk.RIGHT, fill=tk.Y); side.pack_propagate(False)
+        self.vars = {}
+        for label, key, default in [
+            ("Motion threshold:", "motion_threshold", "500"), ("Pulse width (s):", "pulse_width_s", "0.05"), ("Diff threshold:", "diff_threshold", "25"),
+            ("Blur kernel:", "blur_kernel", "21"), ("Background alpha:", "background_alpha", "0.02"), ("Min consecutive frames:", "min_consecutive_frames", "2"),
+            ("Cooldown (s):", "cooldown_s", "0.3"), ("Morph kernel size:", "morph_kernel_size", "3"), ("Morph open iterations:", "morph_open_iterations", "1"),
+            ("Morph close iterations:", "morph_close_iterations", "1"), ("Adaptive k sigma:", "adaptive_k_sigma", "2.5"),
+        ]:
+            r = ttk.Frame(side); r.pack(fill=tk.X, pady=1)
+            ttk.Label(r, text=label).pack(side=tk.LEFT)
+            self.vars[key] = tk.StringVar(value=default)
+            ttk.Entry(r, textvariable=self.vars[key], width=10).pack(side=tk.LEFT, padx=4)
+        self.use_adaptive = tk.BooleanVar(value=False)
+        ttk.Checkbutton(side, text="Use adaptive threshold", variable=self.use_adaptive).pack(anchor="w", pady=(2, 8))
+        zone_box = ttk.LabelFrame(side, text="New zone", padding=6); zone_box.pack(fill=tk.X, pady=8)
+        self.name_var = tk.StringVar(value="zone_1"); self.gpio_var = tk.StringVar(value="17")
+        ttk.Label(zone_box, text="Zone name").pack(anchor="w"); ttk.Entry(zone_box, textvariable=self.name_var).pack(fill=tk.X)
+        ttk.Label(zone_box, text="GPIO").pack(anchor="w"); ttk.Entry(zone_box, textvariable=self.gpio_var).pack(fill=tk.X)
+        ttk.Button(zone_box, text="Add zone from selection", command=self._add_zone).pack(anchor="w", pady=6)
+        self.zone_list = tk.Listbox(side, height=8); self.zone_list.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(side, text="Remove selected zone", command=self._remove_zone).pack(anchor="w", pady=4)
+        self.status_var = tk.StringVar(value=""); ttk.Label(self.editor_frame, textvariable=self.status_var).pack(anchor="w")
+        b = ttk.Frame(self.editor_frame); b.pack(fill=tk.X, pady=6)
         ttk.Button(b, text="Start monitoring", command=self._on_start).pack(side=tk.LEFT, padx=4)
         ttk.Button(b, text="Save JSON...", command=self._save_as).pack(side=tk.LEFT, padx=4)
         ttk.Button(b, text="Back", command=self._show_mode_screen).pack(side=tk.LEFT, padx=4)
         ttk.Button(b, text="Exit", command=self._cancel).pack(side=tk.RIGHT, padx=4)
 
-    def _add_param_row(self, parent: ttk.Frame, label: str, attr: str, default: str) -> None:
-        row = ttk.Frame(parent)
-        row.pack(fill=tk.X, pady=1)
-        var = tk.StringVar(value=default)
-        setattr(self, f"{attr}_var", var)
-        ttk.Label(row, text=label).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=var, width=10).pack(side=tk.LEFT, padx=4)
+    def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._cancel); self.root.mainloop(); return self.result
+    def _show_mode_screen(self): self.editor_frame.pack_forget(); self.mode_frame.pack(fill=tk.BOTH, expand=True); self.root.geometry("500x220")
+    def _show_editor_screen(self): self.mode_frame.pack_forget(); self.editor_frame.pack(fill=tk.BOTH, expand=True); self.root.geometry("1180x760"); self._render_canvas(); self._refresh_zones()
 
-    def run(self) -> tuple[MazeConfig, Path] | None:
-        self.root.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.root.mainloop()
-        return self.result
-
-    def _show_mode_screen(self) -> None:
-        self.editor_frame.pack_forget()
-        self.mode_frame.pack(fill=tk.BOTH, expand=True)
-        self.root.geometry("500x220")
-
-    def _show_editor_screen(self) -> None:
-        self.mode_frame.pack_forget()
-        self.editor_frame.pack(fill=tk.BOTH, expand=True)
-        self.root.geometry("1180x760")
-        self._render_canvas()
-        self._refresh_zone_list()
-
-    def _on_load_json(self) -> None:
+    def _on_load_json(self):
         path = filedialog.askopenfilename(title="Select settings file", initialdir=str(SCRIPT_DIR), filetypes=[("JSON", "*.json"), ("All files", "*.*")])
-        if not path:
-            return
-        try:
-            self.config = load_config(Path(path))
-            self.config_path = Path(path)
-            self._save_on_start = False
-            self._sync_params_to_ui()
-            self._show_editor_screen()
-            self.status_var.set(f"Loaded: {path}")
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            messagebox.showerror("Load error", str(exc), parent=self.root)
+        if not path: return
+        self.config = load_config(Path(path)); self.config_path = Path(path); self._save_on_start = False; self._sync_from_config(); self._show_editor_screen()
+    def _on_interactive(self):
+        h, w = self._frame_bgr.shape[:2]; self.config = MazeConfig(frame_width=w, frame_height=h); self.config_path = DEFAULT_CONFIG_PATH; self._save_on_start = True
+        self._sync_from_config(); self._show_editor_screen()
+    def _sync_from_config(self):
+        for k in self.vars: self.vars[k].set(str(getattr(self.config, k)))
+        self.use_adaptive.set(bool(self.config.use_adaptive_threshold))
+    def _apply_to_config(self):
+        self.config.motion_threshold = int(self.vars["motion_threshold"].get()); self.config.pulse_width_s = float(self.vars["pulse_width_s"].get())
+        self.config.diff_threshold = int(self.vars["diff_threshold"].get()); self.config.blur_kernel = int(self.vars["blur_kernel"].get())
+        self.config.background_alpha = float(self.vars["background_alpha"].get()); self.config.min_consecutive_frames = int(self.vars["min_consecutive_frames"].get())
+        self.config.cooldown_s = float(self.vars["cooldown_s"].get()); self.config.morph_kernel_size = int(self.vars["morph_kernel_size"].get())
+        self.config.morph_open_iterations = int(self.vars["morph_open_iterations"].get()); self.config.morph_close_iterations = int(self.vars["morph_close_iterations"].get())
+        self.config.adaptive_k_sigma = float(self.vars["adaptive_k_sigma"].get()); self.config.use_adaptive_threshold = bool(self.use_adaptive.get())
 
-    def _on_interactive(self) -> None:
-        h, w = self._frame_bgr.shape[:2]
-        self.config = MazeConfig(frame_width=w, frame_height=h)
-        self.config.zones = []
-        self.config_path = DEFAULT_CONFIG_PATH
-        self._save_on_start = True
-        self._sync_params_to_ui()
-        self.name_var.set("zone_1")
-        self.gpio_var.set("17")
-        self._show_editor_screen()
-        self.status_var.set("Drag ROI, set name/GPIO, then click 'Add zone from selection'")
-
-    def _sync_params_to_ui(self) -> None:
-        for attr in [
-            "motion_threshold",
-            "pulse_width_s",
-            "diff_threshold",
-            "blur_kernel",
-            "background_alpha",
-            "min_consecutive_frames",
-            "cooldown_s",
-            "morph_kernel_size",
-            "morph_open_iterations",
-            "morph_close_iterations",
-            "adaptive_k_sigma",
-        ]:
-            getattr(self, f"{attr}_var").set(str(getattr(self.config, attr)))
-        self.use_adaptive_threshold_var.set(bool(self.config.use_adaptive_threshold))
-
-    def _apply_params_from_ui(self) -> None:
-        try:
-            self.config.motion_threshold = int(self.motion_threshold_var.get())
-            self.config.pulse_width_s = float(self.pulse_width_s_var.get())
-            self.config.diff_threshold = int(self.diff_threshold_var.get())
-            self.config.blur_kernel = int(self.blur_kernel_var.get())
-            self.config.background_alpha = float(self.background_alpha_var.get())
-            self.config.min_consecutive_frames = int(self.min_consecutive_frames_var.get())
-            self.config.cooldown_s = float(self.cooldown_s_var.get())
-            self.config.morph_kernel_size = int(self.morph_kernel_size_var.get())
-            self.config.morph_open_iterations = int(self.morph_open_iterations_var.get())
-            self.config.morph_close_iterations = int(self.morph_close_iterations_var.get())
-            self.config.adaptive_k_sigma = float(self.adaptive_k_sigma_var.get())
-            self.config.use_adaptive_threshold = bool(self.use_adaptive_threshold_var.get())
-        except ValueError as exc:
-            raise ValueError("Invalid parameter type") from exc
-
-    def _render_canvas(self) -> None:
-        h, w = self._frame_bgr.shape[:2]
-        self._scale = min(760 / w, 560 / h, 1.0)
-        dw, dh = max(1, int(w * self._scale)), max(1, int(h * self._scale))
-        rgb = cv2.cvtColor(cv2.resize(self._frame_bgr, (dw, dh)), cv2.COLOR_BGR2RGB)
-        self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.canvas.config(width=dw, height=dh)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
-        self._rect_item = None
-        self._pending_roi = None
+    def _render_canvas(self):
+        h, w = self._frame_bgr.shape[:2]; self._scale = min(760 / w, 560 / h, 1.0); dw, dh = max(1, int(w * self._scale)), max(1, int(h * self._scale))
+        rgb = cv2.cvtColor(cv2.resize(self._frame_bgr, (dw, dh)), cv2.COLOR_BGR2RGB); self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.canvas.config(width=dw, height=dh); self.canvas.delete("all"); self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
         for i, z in enumerate(self.config.zones):
-            self._draw_zone_rect(z, i)
-
-    def _canvas_to_frame(self, cx: int, cy: int) -> tuple[int, int]:
-        return int(cx / self._scale), int(cy / self._scale)
-
-    def _on_press(self, event: tk.Event) -> None:
-        self._drag_start = (event.x, event.y)
-        if self._rect_item is not None:
-            self.canvas.delete(self._rect_item)
-            self._rect_item = None
-
-    def _on_drag(self, event: tk.Event) -> None:
-        if self._drag_start is None:
-            return
-        x0, y0 = self._drag_start
-        if self._rect_item is not None:
-            self.canvas.delete(self._rect_item)
-        self._rect_item = self.canvas.create_rectangle(x0, y0, event.x, event.y, outline="#ffff00", width=2)
-
-    def _on_release(self, event: tk.Event) -> None:
-        if self._drag_start is None:
-            return
-        x0, y0 = self._drag_start
-        self._drag_start = None
-        fx0, fy0 = self._canvas_to_frame(min(x0, event.x), min(y0, event.y))
-        fx1, fy1 = self._canvas_to_frame(max(x0, event.x), max(y0, event.y))
-        w, h = fx1 - fx0, fy1 - fy0
-        if w > 5 and h > 5:
-            self._pending_roi = (fx0, fy0, w, h)
-            self.status_var.set(f"Selected ROI: ({fx0},{fy0}) {w}x{h}")
-        else:
-            self._pending_roi = None
-            self.status_var.set("Selection too small")
-
-    def _draw_zone_rect(self, zone: RoiZone, index: int) -> None:
-        x, y, w, h = int(zone.x * self._scale), int(zone.y * self._scale), int(zone.w * self._scale), int(zone.h * self._scale)
-        color = ZONE_COLORS_RGB[index % len(ZONE_COLORS_RGB)]
-        self.canvas.create_rectangle(x, y, x + w, y + h, outline=color, width=2)
-        self.canvas.create_text(x + 4, y + 14, anchor=tk.NW, text=f"{zone.name} GPIO{zone.gpio}", fill=color)
-
-    def _refresh_zone_list(self) -> None:
+            color = ZONE_COLORS_RGB[i % len(ZONE_COLORS_RGB)]
+            x, y, ww, hh = int(z.x * self._scale), int(z.y * self._scale), int(z.w * self._scale), int(z.h * self._scale)
+            self.canvas.create_rectangle(x, y, x + ww, y + hh, outline=color, width=2)
+            self.canvas.create_text(x + 4, y + 14, anchor=tk.NW, text=f"{z.name} GPIO{z.gpio}", fill=color)
+    def _refresh_zones(self):
         self.zone_list.delete(0, tk.END)
-        for z in self.config.zones:
-            self.zone_list.insert(tk.END, f"{z.name} | ({z.x},{z.y}) {z.w}x{z.h} | GPIO{z.gpio}")
-
-    def _add_zone(self) -> None:
-        if self._pending_roi is None:
-            messagebox.showwarning("No selection", "Drag ROI before adding a zone.", parent=self.root)
-            return
-        name = self.name_var.get().strip() or f"zone_{len(self.config.zones) + 1}"
-        try:
-            gpio = int(self.gpio_var.get().strip())
-        except ValueError:
-            messagebox.showerror("Invalid GPIO", "GPIO pin must be integer.", parent=self.root)
-            return
+        for z in self.config.zones: self.zone_list.insert(tk.END, f"{z.name} | ({z.x},{z.y}) {z.w}x{z.h} | GPIO{z.gpio}")
+    def _canvas_to_frame(self, cx, cy): return int(cx / self._scale), int(cy / self._scale)
+    def _on_press(self, e): self._drag_start = (e.x, e.y)
+    def _on_drag(self, e):
+        if self._drag_start is None: return
+        x0, y0 = self._drag_start
+        if self._rect_item is not None: self.canvas.delete(self._rect_item)
+        self._rect_item = self.canvas.create_rectangle(x0, y0, e.x, e.y, outline="#ffff00", width=2)
+    def _on_release(self, e):
+        if self._drag_start is None: return
+        x0, y0 = self._drag_start; self._drag_start = None
+        fx0, fy0 = self._canvas_to_frame(min(x0, e.x), min(y0, e.y)); fx1, fy1 = self._canvas_to_frame(max(x0, e.x), max(y0, e.y))
+        w, h = fx1 - fx0, fy1 - fy0
+        self._pending_roi = (fx0, fy0, w, h) if w > 5 and h > 5 else None
+    def _add_zone(self):
+        if self._pending_roi is None: return
         x, y, w, h = self._pending_roi
-        zone = RoiZone(name=name, x=x, y=y, w=w, h=h, gpio=gpio)
-        try:
-            self._apply_params_from_ui()
-            trial = MazeConfig(**{**self.config.__dict__, "zones": self.config.zones + [zone]})
-            validate_config(trial, frame_width=self.config.frame_width, frame_height=self.config.frame_height)
-        except ValueError as exc:
-            messagebox.showerror("Error", str(exc), parent=self.root)
-            return
-        self.config.zones.append(zone)
-        self._pending_roi = None
-        self._render_canvas()
-        self._refresh_zone_list()
-        self.name_var.set(f"zone_{len(self.config.zones) + 1}")
-        self.status_var.set(f"Added zone '{name}' (GPIO{gpio})")
-
-    def _remove_zone(self) -> None:
+        self.config.zones.append(RoiZone(name=self.name_var.get().strip() or f"zone_{len(self.config.zones)+1}", x=x, y=y, w=w, h=h, gpio=int(self.gpio_var.get())))
+        self._render_canvas(); self._refresh_zones()
+    def _remove_zone(self):
         sel = self.zone_list.curselection()
-        if not sel:
-            messagebox.showwarning("Nothing selected", "Select a zone to remove.", parent=self.root)
-            return
+        if not sel: return
         del self.config.zones[sel[0]]
-        self._render_canvas()
-        self._refresh_zone_list()
-        self.status_var.set("Zone removed")
-
-    def _save_as(self) -> None:
-        try:
-            self._apply_params_from_ui()
-            validate_config(self.config, frame_width=self.config.frame_width, frame_height=self.config.frame_height)
-        except ValueError as exc:
-            messagebox.showerror("Error", str(exc), parent=self.root)
-            return
-        path = filedialog.asksaveasfilename(title="Save settings", initialdir=str(SCRIPT_DIR), initialfile="maze_config.json", defaultextension=".json", filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            save_config(self.config, Path(path))
-            self.config_path = Path(path)
-            self.status_var.set(f"Saved: {path}")
-        except OSError as exc:
-            messagebox.showerror("Save error", str(exc), parent=self.root)
-
-    def _on_start(self) -> None:
-        try:
-            self._apply_params_from_ui()
-            validate_config(self.config, frame_width=self.config.frame_width, frame_height=self.config.frame_height)
-        except ValueError as exc:
-            messagebox.showerror("Error", str(exc), parent=self.root)
-            return
-        if self._save_on_start:
-            try:
-                save_config(self.config, self.config_path)
-            except OSError as exc:
-                messagebox.showerror("Save error", str(exc), parent=self.root)
-                return
-        self.result = (self.config, self.config_path)
-        self.root.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.root.destroy()
-
-
-def init_zone_runtime(zones: list[RoiZone], gray_frame: np.ndarray, blur_kernel: int) -> None:
-    k = (blur_kernel, blur_kernel)
-    for zone in zones:
-        x, y, w, h = zone.rect()
-        zone.background = cv2.GaussianBlur(gray_frame[y : y + h, x : x + w], k, 0).astype(np.float32)
-        zone.consecutive_count = 0
-        zone.last_trigger_time = 0.0
-
-
-def process_zone(zone: RoiZone, gray: np.ndarray, config: MazeConfig) -> tuple[bool, np.ndarray, float]:
-    x, y, w, h = zone.rect()
-    roi_blurred = cv2.GaussianBlur(gray[y : y + h, x : x + w], (config.blur_kernel, config.blur_kernel), 0)
-    diff = cv2.absdiff(cv2.convertScaleAbs(zone.background), roi_blurred)
-    if config.use_adaptive_threshold:
-        threshold = max(float(config.diff_threshold), float(np.std(diff)) * config.adaptive_k_sigma)
-    else:
-        threshold = float(config.diff_threshold)
-    mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)[1]
-    kernel = np.ones((config.morph_kernel_size, config.morph_kernel_size), dtype=np.uint8)
-    if config.morph_open_iterations > 0:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=config.morph_open_iterations)
-    if config.morph_close_iterations > 0:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=config.morph_close_iterations)
-    motion_amount = float(np.sum(mask) / 255.0)
-    raw_motion = motion_amount > config.motion_threshold
-    cv2.accumulateWeighted(roi_blurred.astype(np.float32), zone.background, config.background_alpha)
-    return raw_motion, mask, motion_amount
+        self._render_canvas(); self._refresh_zones()
+    def _save_as(self):
+        self._apply_to_config(); validate_config(self.config, frame_width=self.config.frame_width, frame_height=self.config.frame_height)
+        p = filedialog.asksaveasfilename(title="Save settings", initialdir=str(SCRIPT_DIR), initialfile="maze_config.json", defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if p: save_config(self.config, Path(p)); self.config_path = Path(p)
+    def _on_start(self):
+        self._apply_to_config(); validate_config(self.config, frame_width=self.config.frame_width, frame_height=self.config.frame_height)
+        if self._save_on_start: save_config(self.config, self.config_path)
+        self.result = (self.config, self.config_path); self.root.destroy()
+    def _cancel(self): self.result = None; self.root.destroy()
 
 
 def draw_zones(frame: np.ndarray, zones: list[RoiZone], active: dict[str, bool], debug: dict[str, str]) -> None:
     for i, zone in enumerate(zones):
-        x, y, w, h = zone.rect()
         color = ZONE_COLORS[i % len(ZONE_COLORS)]
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(frame, f"{zone.name} GPIO{zone.gpio}", (x, max(y - 8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.rectangle(frame, (zone.x, zone.y), (zone.x + zone.w, zone.y + zone.h), color, 2)
+        cv2.putText(frame, f"{zone.name} GPIO{zone.gpio}", (zone.x, max(zone.y - 8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         if active.get(zone.name):
-            cv2.putText(frame, "MOTION", (x + 4, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        cv2.putText(frame, debug.get(zone.name, ""), (x + 4, min(y + h - 8, frame.shape[0] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            cv2.putText(frame, "MOTION", (zone.x + 4, zone.y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.putText(frame, debug.get(zone.name, ""), (zone.x + 4, min(zone.y + zone.h - 8, frame.shape[0] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
 
 def open_camera(config: MazeConfig) -> cv2.VideoCapture:
@@ -571,109 +550,96 @@ def open_camera(config: MazeConfig) -> cv2.VideoCapture:
 
 
 def run_monitoring(cap: cv2.VideoCapture, config: MazeConfig, first_frame: np.ndarray) -> None:
-    init_zone_runtime(config.zones, cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY), config.blur_kernel)
-    try:
-        gpio = GpioManager([z.gpio for z in config.zones], config.pulse_width_s)
-    except RuntimeError as exc:
-        messagebox.showerror("GPIO error", str(exc))
-        return
+    runtime = RuntimeState()
+    gray0 = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+    init_zone_runtime(config.zones, gray0, config.blur_kernel)
+    runtime.latest_gray = gray0
+    gpio_lock = threading.Lock()
+    gpio = GpioManager([z.gpio for z in config.zones], config.pulse_width_s)
 
-    if not gpio.available and lgpio is None:
-        messagebox.showwarning("GPIO unavailable", "lgpio is not installed. Monitoring continues without TTL.")
+    def rebuild_gpio_if_needed():
+        nonlocal gpio
+        pins = [z.gpio for z in config.zones]
+        if gpio.has_same_pins(pins):
+            return
+        with gpio_lock:
+            gpio.close()
+            gpio = GpioManager(pins, config.pulse_width_s)
+
+    RuntimeControlPanel(config, runtime, gray0.shape, rebuild_gpio_if_needed).start()
 
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
-                messagebox.showerror("Camera", "Failed to read frame from camera")
                 break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            with runtime.lock:
+                runtime.latest_gray = gray.copy()
+                zones = list(config.zones)
+                cfg = MazeConfig(**{**config.__dict__, "zones": zones})
             combined_mask = np.zeros_like(gray)
             active: dict[str, bool] = {}
             debug: dict[str, str] = {}
             now = time.time()
-            for zone in config.zones:
-                raw_motion, mask, amount = process_zone(zone, gray, config)
+            for zone in zones:
+                if zone.background is None:
+                    init_zone_runtime([zone], gray, cfg.blur_kernel)
+                raw_motion, mask, amount = process_zone(zone, gray, cfg)
                 zone.consecutive_count = zone.consecutive_count + 1 if raw_motion else 0
-                cooldown_left = max(0.0, config.cooldown_s - (now - zone.last_trigger_time))
-                should_trigger = zone.consecutive_count >= config.min_consecutive_frames and cooldown_left <= 0.0
-                if should_trigger:
-                    gpio.pulse_async(zone.gpio)
+                cd_left = max(0.0, cfg.cooldown_s - (now - zone.last_trigger_time))
+                if zone.consecutive_count >= cfg.min_consecutive_frames and cd_left <= 0:
+                    with gpio_lock:
+                        gpio.pulse_async(zone.gpio)
                     zone.last_trigger_time = now
                     zone.consecutive_count = 0
                 active[zone.name] = raw_motion
-                debug[zone.name] = f"amt:{amount:.0f} cnt:{zone.consecutive_count} cd:{cooldown_left:.1f}s"
-                x, y, w, h = zone.rect()
-                combined_mask[y : y + h, x : x + w] = cv2.bitwise_or(combined_mask[y : y + h, x : x + w], mask)
-
-            draw_zones(frame, config.zones, active, debug)
-            cv2.putText(frame, "Press Q to stop", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                debug[zone.name] = f"amt:{amount:.0f} cnt:{zone.consecutive_count} cd:{cd_left:.1f}s"
+                combined_mask[zone.y : zone.y + zone.h, zone.x : zone.x + zone.w] = cv2.bitwise_or(combined_mask[zone.y : zone.y + zone.h, zone.x : zone.x + zone.w], mask)
+            with runtime.lock:
+                zone_by_name = {z.name: z for z in zones}
+                for i, z in enumerate(config.zones):
+                    if z.name in zone_by_name:
+                        config.zones[i] = zone_by_name[z.name]
+            draw_zones(frame, zones, active, debug)
+            cv2.putText(frame, "Q=quit | Runtime Control window stays live", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             cv2.imshow("Lab Feed", frame)
             cv2.imshow("Motion Mask", combined_mask)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
-        gpio.close()
+        runtime.running = False
+        with gpio_lock:
+            gpio.close()
         cv2.destroyAllWindows()
 
 
 def main() -> None:
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Camera", "Could not open camera")
-        root.destroy()
-        return
+        root = tk.Tk(); root.withdraw(); messagebox.showerror("Camera", "Could not open camera"); root.destroy(); return
     ok, first_frame = cap.read()
     if not ok:
         cap.release()
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Camera", "Could not read frame from camera")
-        root.destroy()
-        return
-
+        root = tk.Tk(); root.withdraw(); messagebox.showerror("Camera", "Could not read frame from camera"); root.destroy(); return
     try:
-        gui = MazeSetupGUI(first_frame)
-        result = gui.run()
+        setup = MazeSetupGUI(first_frame)
+        result = setup.run()
     except RuntimeError as exc:
         cap.release()
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Error", str(exc))
-        root.destroy()
-        return
-
+        root = tk.Tk(); root.withdraw(); messagebox.showerror("Error", str(exc)); root.destroy(); return
     if result is None:
-        cap.release()
-        return
+        cap.release(); return
     config, _ = result
     cap.release()
     cap = open_camera(config)
     if not cap.isOpened():
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Camera", "Could not open camera for monitoring")
-        root.destroy()
-        return
+        root = tk.Tk(); root.withdraw(); messagebox.showerror("Camera", "Could not open camera for monitoring"); root.destroy(); return
     ok, first_frame = cap.read()
     if not ok:
         cap.release()
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Camera", "Could not read frame for monitoring")
-        root.destroy()
-        return
-    try:
-        validate_config(config, frame_width=first_frame.shape[1], frame_height=first_frame.shape[0])
-    except ValueError as exc:
-        cap.release()
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Config error", str(exc))
-        root.destroy()
-        return
+        root = tk.Tk(); root.withdraw(); messagebox.showerror("Camera", "Could not read frame for monitoring"); root.destroy(); return
+    validate_config(config, frame_width=first_frame.shape[1], frame_height=first_frame.shape[0])
     try:
         run_monitoring(cap, config, first_frame)
     finally:
