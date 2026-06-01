@@ -213,6 +213,41 @@ def validate_config(config: MazeConfig, frame_width: int | None = None, frame_he
             raise ValueError(f"Zone '{zone.name}' is outside frame bounds ({fw}x{fh})")
 
 
+DEFAULT_ZONE_X = 8
+DEFAULT_ZONE_Y = 8
+DEFAULT_ZONE_W = 120
+DEFAULT_ZONE_H = 90
+
+
+def suggest_zone_name(zones: list[RoiZone]) -> str:
+    existing = {z.name for z in zones}
+    n = 1
+    while True:
+        name = f"zone_{n}"
+        if name not in existing:
+            return name
+        n += 1
+
+
+def suggest_zone_gpio(zones: list[RoiZone]) -> int:
+    used = {z.gpio for z in zones}
+    for pin in (17, 27, 22, 23, 24, 25, 5, 6, 12, 13, 16, 19, 20, 21, 26):
+        if pin not in used:
+            return pin
+    n = 17
+    while n in used:
+        n += 1
+    return n
+
+
+def make_default_zone(name: str, gpio: int, frame_width: int, frame_height: int) -> RoiZone:
+    w = min(DEFAULT_ZONE_W, frame_width)
+    h = min(DEFAULT_ZONE_H, frame_height)
+    x = min(DEFAULT_ZONE_X, max(0, frame_width - w))
+    y = min(DEFAULT_ZONE_Y, max(0, frame_height - h))
+    return RoiZone(name=name, x=x, y=y, w=w, h=h, gpio=gpio)
+
+
 class GpioManager:
     def __init__(self, pins: list[int], pulse_width_s: float):
         self._pulse_width_s = pulse_width_s
@@ -335,21 +370,23 @@ class RuntimeControlPanel:
         use_adapt = tk.BooleanVar(value=False)
         ttk.Checkbutton(p, text="use_adaptive_threshold", variable=use_adapt).pack(anchor="w", pady=4)
 
-        ttk.Label(p, text="Zones (name | x y w h gpio)").pack(anchor="w", pady=(10, 2))
+        ttk.Label(p, text="Zones (name | gpio | position — drag on Lab Feed)").pack(anchor="w", pady=(10, 2))
         zones_list = tk.Listbox(p, height=10)
         zones_list.pack(fill=tk.BOTH, expand=True)
 
-        edit = ttk.Frame(p)
-        edit.pack(fill=tk.X, pady=6)
+        zone_box = ttk.LabelFrame(p, text="Add / edit zone", padding=6)
+        zone_box.pack(fill=tk.X, pady=6)
         z_name = tk.StringVar()
-        z_x = tk.StringVar()
-        z_y = tk.StringVar()
-        z_w = tk.StringVar()
-        z_h = tk.StringVar()
         z_gpio = tk.StringVar()
-        for txt, var, width in [("name", z_name, 10), ("x", z_x, 4), ("y", z_y, 4), ("w", z_w, 4), ("h", z_h, 4), ("gpio", z_gpio, 5)]:
-            ttk.Label(edit, text=txt).pack(side=tk.LEFT)
-            ttk.Entry(edit, textvariable=var, width=width).pack(side=tk.LEFT, padx=2)
+        ttk.Label(zone_box, text="Zone name").pack(anchor="w")
+        ttk.Entry(zone_box, textvariable=z_name).pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(zone_box, text="GPIO").pack(anchor="w")
+        ttk.Entry(zone_box, textvariable=z_gpio, width=8).pack(anchor="w")
+        ttk.Label(
+            zone_box,
+            text="New zones start top-left; move and resize by dragging on Lab Feed.",
+            wraplength=480,
+        ).pack(anchor="w", pady=(6, 0))
 
         status = tk.StringVar(value="")
         ttk.Label(p, textvariable=status).pack(anchor="w", pady=(2, 6))
@@ -369,7 +406,11 @@ class RuntimeControlPanel:
                 zones = list(self.config.zones)
             zones_list.delete(0, tk.END)
             for z in zones:
-                zones_list.insert(tk.END, f"{z.name} | {z.x} {z.y} {z.w} {z.h} {z.gpio}")
+                zones_list.insert(tk.END, f"{z.name} | GPIO{z.gpio} | ({z.x},{z.y}) {z.w}x{z.h}")
+            if not z_name.get().strip():
+                z_name.set(suggest_zone_name(zones))
+            if not z_gpio.get().strip():
+                z_gpio.set(str(suggest_zone_gpio(zones)))
 
         def apply_params():
             try:
@@ -395,10 +436,14 @@ class RuntimeControlPanel:
                 return
             with self.runtime.lock:
                 z = self.config.zones[idx[0]]
-            z_name.set(z.name); z_x.set(str(z.x)); z_y.set(str(z.y)); z_w.set(str(z.w)); z_h.set(str(z.h)); z_gpio.set(str(z.gpio))
+            z_name.set(z.name)
+            z_gpio.set(str(z.gpio))
 
-        def _new_zone_from_inputs() -> RoiZone:
-            return RoiZone(name=z_name.get().strip(), x=int(z_x.get()), y=int(z_y.get()), w=int(z_w.get()), h=int(z_h.get()), gpio=int(z_gpio.get()))
+        def _zone_name_and_gpio() -> tuple[str, int]:
+            name = z_name.get().strip()
+            if not name:
+                raise ValueError("Zone name is required")
+            return name, int(z_gpio.get())
 
         def _init_zone_bg(z: RoiZone):
             if self.runtime.latest_gray is None:
@@ -412,14 +457,17 @@ class RuntimeControlPanel:
 
         def add_zone():
             try:
-                nz = _new_zone_from_inputs()
+                name, gpio = _zone_name_and_gpio()
+                nz = make_default_zone(name, gpio, self.frame_w, self.frame_h)
                 with self.runtime.lock:
                     self.config.zones.append(nz)
                     validate_config(self.config, frame_width=self.frame_w, frame_height=self.frame_h)
                     _init_zone_bg(nz)
                     self.on_gpio_change()
+                z_name.set("")
+                z_gpio.set("")
                 refresh()
-                status.set("Zone added")
+                status.set(f"Zone added at ({nz.x},{nz.y}) {nz.w}x{nz.h} — drag on Lab Feed to adjust")
             except Exception as exc:
                 status.set(f"Error: {exc}")
 
@@ -429,14 +477,26 @@ class RuntimeControlPanel:
                 status.set("Select zone first")
                 return
             try:
-                uz = _new_zone_from_inputs()
+                name, gpio = _zone_name_and_gpio()
                 with self.runtime.lock:
+                    old = self.config.zones[idx[0]]
+                    uz = RoiZone(
+                        name=name,
+                        x=old.x,
+                        y=old.y,
+                        w=old.w,
+                        h=old.h,
+                        gpio=gpio,
+                        background=old.background,
+                        consecutive_count=old.consecutive_count,
+                        last_trigger_time=old.last_trigger_time,
+                    )
                     self.config.zones[idx[0]] = uz
                     validate_config(self.config, frame_width=self.frame_w, frame_height=self.frame_h)
-                    _init_zone_bg(uz)
-                    self.on_gpio_change()
+                    if old.name != name or old.gpio != gpio:
+                        self.on_gpio_change()
                 refresh()
-                status.set("Zone updated")
+                status.set("Zone name/GPIO updated (position unchanged)")
             except Exception as exc:
                 status.set(f"Error: {exc}")
 
@@ -749,10 +809,10 @@ def run_monitoring(cap: cv2.VideoCapture, config: MazeConfig, first_frame: np.nd
             draw_zones(frame, zones, active, debug)
             cv2.putText(
                 frame,
-                "Q=quit | Drag zone to move | Drag bottom-right corner to resize",
+                "Q=quit | Drag zone to move | Drag bottom-right to resize | Add zone: Runtime Control (name + GPIO)",
                 (10, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.45,
                 (255, 255, 255),
                 1,
             )
