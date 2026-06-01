@@ -352,9 +352,13 @@ class RuntimeControlPanel:
     def _run(self) -> None:
         root = tk.Tk()
         root.title("Runtime Control")
-        root.geometry("540x620")
+        root.geometry("560x820")
+        root.minsize(520, 760)
         p = ttk.Frame(root, padding=10)
         p.pack(fill=tk.BOTH, expand=True)
+
+        params_frame = ttk.LabelFrame(p, text="Parameters", padding=6)
+        params_frame.pack(fill=tk.X)
 
         fields = {}
         for label, key in [
@@ -368,7 +372,7 @@ class RuntimeControlPanel:
             ("morph_close_iterations", "morph_close_iterations"),
             ("adaptive_k_sigma", "adaptive_k_sigma"),
         ]:
-            r = ttk.Frame(p)
+            r = ttk.Frame(params_frame)
             r.pack(fill=tk.X, pady=2)
             ttk.Label(r, text=label, width=22).pack(side=tk.LEFT)
             var = tk.StringVar()
@@ -376,14 +380,13 @@ class RuntimeControlPanel:
             fields[key] = var
 
         use_adapt = tk.BooleanVar(value=False)
-        ttk.Checkbutton(p, text="use_adaptive_threshold", variable=use_adapt).pack(anchor="w", pady=4)
+        ttk.Checkbutton(params_frame, text="use_adaptive_threshold", variable=use_adapt).pack(anchor="w", pady=(4, 0))
 
-        ttk.Label(p, text="Zones (name | gpio | position — drag on Lab Feed)").pack(anchor="w", pady=(10, 2))
-        zones_list = tk.Listbox(p, height=10)
-        zones_list.pack(fill=tk.BOTH, expand=True)
+        apply_btn = ttk.Button(p, text="Apply parameters")
+        zones_label = ttk.Label(p, text="Zones (name | gpio | position — drag on Lab Feed)")
+        zones_list = tk.Listbox(p, height=8)
 
         zone_box = ttk.LabelFrame(p, text="Add / edit zone", padding=6)
-        zone_box.pack(fill=tk.X, pady=6)
         z_name = tk.StringVar()
         z_gpio = tk.StringVar()
         ttk.Label(zone_box, text="Zone name").pack(anchor="w")
@@ -396,8 +399,11 @@ class RuntimeControlPanel:
             wraplength=480,
         ).pack(anchor="w", pady=(6, 0))
 
+        zone_btns = ttk.Frame(zone_box)
+        zone_btns.pack(fill=tk.X, pady=(8, 0))
+
         status = tk.StringVar(value="")
-        ttk.Label(p, textvariable=status).pack(anchor="w", pady=(2, 6))
+        status_label = ttk.Label(p, textvariable=status)
 
         def refresh_zones_list():
             sel = zones_list.curselection()
@@ -538,13 +544,17 @@ class RuntimeControlPanel:
             refresh()
             status.set("Zone deleted")
 
-        btns = ttk.Frame(p)
-        btns.pack(fill=tk.X)
-        ttk.Button(btns, text="Apply params", command=apply_params).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Load selected", command=load_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Add zone", command=add_zone).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Update zone", command=update_zone).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Delete zone", command=delete_zone).pack(side=tk.LEFT, padx=2)
+        apply_btn.configure(command=apply_params)
+        apply_btn.pack(anchor="w", pady=(8, 0))
+        zones_label.pack(anchor="w", pady=(12, 2))
+        zones_list.pack(fill=tk.BOTH, expand=True)
+        zone_box.pack(fill=tk.X, pady=(6, 0))
+        status_label.pack(anchor="w", pady=(8, 0))
+
+        ttk.Button(zone_btns, text="Add zone", command=add_zone).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(zone_btns, text="Load selected", command=load_selected).pack(side=tk.LEFT, padx=4)
+        ttk.Button(zone_btns, text="Update zone", command=update_zone).pack(side=tk.LEFT, padx=4)
+        ttk.Button(zone_btns, text="Delete zone", command=delete_zone).pack(side=tk.LEFT, padx=4)
 
         self.runtime.refresh_zones_list = lambda: root.after(0, refresh_zones_list)
 
