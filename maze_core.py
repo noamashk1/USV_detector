@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -164,6 +165,13 @@ class RuntimeState:
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     latest_gray: np.ndarray | None = field(default=None, repr=False)
     running: bool = True
+    refresh_zones_list: Callable[[], None] | None = field(default=None, repr=False)
+
+
+def notify_zones_geometry_changed(runtime: RuntimeState) -> None:
+    fn = runtime.refresh_zones_list
+    if fn is not None:
+        fn()
 
 
 def load_config(path: Path) -> MazeConfig:
@@ -391,6 +399,25 @@ class RuntimeControlPanel:
         status = tk.StringVar(value="")
         ttk.Label(p, textvariable=status).pack(anchor="w", pady=(2, 6))
 
+        def refresh_zones_list():
+            sel = zones_list.curselection()
+            selected_name = None
+            if sel:
+                with self.runtime.lock:
+                    if sel[0] < len(self.config.zones):
+                        selected_name = self.config.zones[sel[0]].name
+            with self.runtime.lock:
+                zones = list(self.config.zones)
+            zones_list.delete(0, tk.END)
+            for z in zones:
+                zones_list.insert(tk.END, f"{z.name} | GPIO{z.gpio} | ({z.x},{z.y}) {z.w}x{z.h}")
+            if selected_name is not None:
+                for i, z in enumerate(zones):
+                    if z.name == selected_name:
+                        zones_list.selection_set(i)
+                        zones_list.see(i)
+                        break
+
         def refresh():
             with self.runtime.lock:
                 fields["motion_threshold"].set(str(self.config.motion_threshold))
@@ -404,9 +431,7 @@ class RuntimeControlPanel:
                 fields["adaptive_k_sigma"].set(str(self.config.adaptive_k_sigma))
                 use_adapt.set(bool(self.config.use_adaptive_threshold))
                 zones = list(self.config.zones)
-            zones_list.delete(0, tk.END)
-            for z in zones:
-                zones_list.insert(tk.END, f"{z.name} | GPIO{z.gpio} | ({z.x},{z.y}) {z.w}x{z.h}")
+            refresh_zones_list()
             if not z_name.get().strip():
                 z_name.set(suggest_zone_name(zones))
             if not z_gpio.get().strip():
@@ -521,9 +546,14 @@ class RuntimeControlPanel:
         ttk.Button(btns, text="Update zone", command=update_zone).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Delete zone", command=delete_zone).pack(side=tk.LEFT, padx=2)
 
+        self.runtime.refresh_zones_list = lambda: root.after(0, refresh_zones_list)
+
         refresh()
         root.protocol("WM_DELETE_WINDOW", root.withdraw)
-        root.mainloop()
+        try:
+            root.mainloop()
+        finally:
+            self.runtime.refresh_zones_list = None
 
 
 class MazeSetupGUI:
@@ -756,6 +786,7 @@ def run_monitoring(cap: cv2.VideoCapture, config: MazeConfig, first_frame: np.nd
                     dy = y - drag_state["start_y"]
                     zone.w = max(min_zone_size, min(drag_state["orig_w"] + dx, config.frame_width - zone.x))
                     zone.h = max(min_zone_size, min(drag_state["orig_h"] + dy, config.frame_height - zone.y))
+                notify_zones_geometry_changed(runtime)
 
             elif event == cv2.EVENT_LBUTTONUP and drag_state["mode"] is not None:
                 zone = next((z for z in zones if z.name == drag_state["zone_name"]), None)
