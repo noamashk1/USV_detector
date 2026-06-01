@@ -1,10 +1,62 @@
+import importlib.util
 import json
+import os
+import shutil
+import sys
 import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+
+def _prepare_opencv_qt_fonts() -> None:
+    """OpenCV highgui on Linux uses Qt; recent wheels no longer bundle fonts."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    spec = importlib.util.find_spec("cv2")
+    if spec is None or not spec.origin:
+        return
+
+    qt_fonts = Path(spec.origin).resolve().parent / "qt" / "fonts"
+    if any(qt_fonts.glob("*.ttf")) or any(qt_fonts.glob("*.otf")):
+        return
+
+    system_dirs = (
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/dejavu"),
+        Path("/usr/share/fonts/truetype/liberation"),
+        Path("/usr/share/fonts/TTF"),
+    )
+    for font_dir in system_dirs:
+        if font_dir.is_dir():
+            os.environ.setdefault("QT_QPA_FONTDIR", str(font_dir))
+            break
+
+    for font_dir in system_dirs:
+        if not font_dir.is_dir():
+            continue
+        sources = [
+            font_dir / name
+            for name in ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Regular.ttf")
+            if (font_dir / name).is_file()
+        ]
+        if not sources:
+            continue
+        try:
+            qt_fonts.mkdir(parents=True, exist_ok=True)
+            for src in sources:
+                dest = qt_fonts / src.name
+                if not dest.exists():
+                    shutil.copy2(src, dest)
+        except OSError:
+            pass
+        break
+
+
+_prepare_opencv_qt_fonts()
 
 import cv2
 import numpy as np
