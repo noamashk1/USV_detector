@@ -35,5 +35,6 @@ dist/
 *.png
 *.pdf
 *.svg
+*.mat
 
 Recordings/
