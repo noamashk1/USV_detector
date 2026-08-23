@@ -30,4 +30,3 @@ except KeyboardInterrupt:
 finally:
     lgpio.gpio_write(h, GPIO, 0)
     lgpio.gpiochip_close(h)
-
